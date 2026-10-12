@@ -1,0 +1,9 @@
+node_modules/
+.env*
+!.env.example
+config.json
+*.local.json
+*.log
+screenshots/
+artifacts/
+.DS_Store

@@ -1,0 +1,6 @@
+{
+  "botToken": "PASTE_LOCALLY_OR_USE_TELEGRAM_BOT_TOKEN",
+  "chatId": "YOUR_PRIVATE_CHAT_ID",
+  "endpoint": "chrome",
+  "intervalSeconds": 10
+}
