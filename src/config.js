@@ -41,7 +41,7 @@ export async function saveConfig(path, config) {
 export function requireTelegram(config) {
   if (!config.botToken || !config.chatId) throw new Error('Telegram is not configured. Run setup, or use watch --dry-run.');
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken)) throw new Error('Invalid Telegram bot token format. Run setup again.');
-  if (!/^\d+$/.test(config.chatId)) throw new Error('Use a numeric private Telegram chat ID. Run setup again.');
+  if (!/^-?[1-9]\d*$/.test(config.chatId)) throw new Error('Use a numeric Telegram chat ID (negative for groups). Run setup again.');
 }
 
 export function redact(message, token = '') {

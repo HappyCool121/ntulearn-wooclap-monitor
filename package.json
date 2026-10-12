@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/HappyCool121/ntulearn-wooclap-monitor.git" },
   "type": "module",
-  "description": "Read-only Wooclap question monitoring with Telegram alerts",
+  "description": "Wooclap question image alerts with Luna answer suggestions through Telegram",
   "engines": { "node": ">=22" },
   "bin": { "ntulearn-watch": "src/cli.js" },
   "scripts": {
@@ -14,7 +14,7 @@
     "doctor": "node src/cli.js doctor",
     "test": "node --test test/*.test.js",
     "test:browser": "node --test test/browser.integration.js",
-    "check": "node --check src/cli.js && node --check src/browser.js && node --check src/detection.js && node --check src/monitor.js && node --check src/telegram.js && node --check src/config.js && node --check src/prompt.js && node --check src/question-image.js"
+    "check": "node --check src/cli.js && node --check src/browser.js && node --check src/detection.js && node --check src/monitor.js && node --check src/telegram.js && node --check src/config.js && node --check src/prompt.js && node --check src/question-image.js && node --check src/answers.js && node --check src/telegram-receiver.js && node --check src/codex-suggestions.js && node --check src/constants.js"
   },
   "dependencies": { "commander": "15.0.0", "playwright": "1.64.0" }
 }

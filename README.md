@@ -2,17 +2,19 @@
 
 [![CI](https://github.com/HappyCool121/ntulearn-wooclap-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/HappyCool121/ntulearn-wooclap-monitor/actions/workflows/ci.yml)
 
-Monitor a Wooclap session embedded in your logged-in NTULearn Chrome tab. Receive an image alert in your private Telegram chat when a question appears.
+Monitor a Wooclap session embedded in your logged-in NTULearn Chrome tab. Receive immediate image alerts in a private Telegram chat or group. Optionally append a Luna suggested answer and brief reasoning to the same alert with `watch --suggestions`.
 
 - Checks the selected session every **10 seconds**.
 - Captures the original question and answer choices without scrolling or changing your lecture tab.
 - Recreates a readable card from the question's MathML if native capture fails or would cut off content.
 - Suppresses repeated alerts for an unchanged question and reports prolonged monitoring outages.
-- Uses deterministic DOM inspection. No AI API, paid inference service, or Telegram webhook is required.
+- Optionally generates suggestions with the authenticated local Codex CLI using `gpt-6-luna`. Each delivered question finishes even if newer questions appear.
+- Telegram answer submission is deferred: no answer buttons, reply handling, receiver, or browser submission starts during watching.
+- Detection uses deterministic DOM inspection. Suggestions use inference; no Telegram webhook or hosted server is required.
 
 ![Synthetic example of a recreated mathematical question](docs/example-question.jpg)
 
-This repository publishes the source code. Run the monitor on a computer with your own logged-in Chrome session and your own Telegram bot. GitHub does not run the lecture watcher for you. The current version supports **one private chat per process**. Group destinations, automatic subscriptions, and `/subscribe` commands are not implemented.
+This repository publishes the source code. Run the monitor on a computer with your own logged-in Chrome session and your own Telegram bot. GitHub does not run the lecture watcher for you. The current version supports **one explicitly configured private chat, group, or supergroup per process**. Adding the bot alone does not subscribe a group; automatic subscriptions and `/subscribe` commands are not implemented. Channels are not supported.
 
 ## Requirements
 
@@ -20,8 +22,9 @@ This repository publishes the source code. Run the monitor on a computer with yo
 - Recent Google Chrome with `chrome://inspect/#remote-debugging` available, or an existing local Chrome DevTools Protocol endpoint.
 - A logged-in NTULearn tab displaying the embedded Wooclap session.
 - A Telegram account and a bot created through [BotFather](https://t.me/BotFather).
+- For optional suggestions (`watch --suggestions`), a recent [Codex CLI](https://learn.chatgpt.com/docs/cli) on `PATH`, with `codex login` completed and access to `gpt-6-luna`. The CLI must support `--no-daemon`, `--ephemeral`, and `--ignore-user-config`. No separate API key is needed when using saved ChatGPT authentication. Basic `watch` works without Codex; `--no-suggestions` is also accepted.
 
-Tested locally on macOS. CI runs unit tests on Node 22/24 and isolated Chrome browser tests on Linux. Chrome channel attachment depends on your installed Chrome version and profile. The tool's default target host is `ntulearn.ntu.edu.sg`; standalone Wooclap tabs and other learning systems are not selected.
+Tested locally on macOS. Suggestion process-group cleanup targets macOS/Linux. CI runs unit tests on Node 22/24 and isolated Chrome browser tests on Linux. Chrome channel attachment depends on your installed Chrome version and profile. The tool's default target host is `ntulearn.ntu.edu.sg`; standalone Wooclap tabs and other learning systems are not selected.
 
 ## Install
 
@@ -44,11 +47,20 @@ Normal monitoring uses your installed Chrome, so it does not require downloading
    node src/cli.js setup
    ```
 
-5. Paste your token into the hidden local prompt. Setup validates the bot, discovers private chats, lets you choose when several match, saves configuration, and sends a test message.
+5. Paste your token into the hidden local prompt. Setup validates the bot, discovers private chats and groups, lets you choose when several match, saves configuration, and sends a test message.
 
-Settings are stored outside the repository at `~/.config/ntulearn-wooclap-monitor/config.json`, with `0600` file permissions on POSIX systems. Environment variables can override them. Setup reuses existing settings; edit that local file or use environment variables to change them.
+Settings are stored outside the repository at `~/.config/ntulearn-wooclap-monitor/config.json`, with `0600` file permissions on POSIX systems. Environment variables can override them. Setup reuses existing settings. Use `setup --select-chat` to choose another destination, or `setup --chat <id>` to set an explicit numeric ID. Group IDs are negative. Environment variables continue to override saved settings.
 
 Sending `/start` is a one-time setup step. It does not automatically subscribe other users or groups. Use a dedicated bot: setup preserves existing webhooks rather than removing another service's configuration. See [Telegram's official tutorial](https://core.telegram.org/bots/tutorial) for bot creation.
+
+## Send alerts to a group
+
+1. Add your bot to the Telegram group. If invitations are disabled, enable `/setjoingroups` in [BotFather](https://t.me/BotFather).
+2. Send `/start@YourBotUsername` in that group (for this bot: `/start@wooclapper_bot`). Privacy mode can stay enabled; ordinary permission to post messages and photos is sufficient.
+3. Run `node src/cli.js setup --select-chat` and choose the group. This replaces the saved destination and sends a test notification.
+4. Start the watcher. All notifications and optional suggestion edits go to that chosen destination.
+
+If discovery cannot find the chat among pending updates, use `node src/cli.js setup --chat <id>` or `TELEGRAM_CHAT_ID`. Setup validates access and rejects channels. Existing webhooks are preserved. After a group upgrades to a supergroup, use setup again with its new ID and restart the watcher; migration errors report the replacement ID. Separate watchers/config files can target separate destinations.
 
 ## Connect your Chrome tab
 
@@ -75,11 +87,14 @@ The tool does not enable debugging or open a debugging port itself. An automatio
 ## Run for each lecture
 
 ```bash
-# Optional: inspect detection without sending Telegram messages.
+# Optional: inspect detection and images without Telegram or Codex calls.
 node src/cli.js watch --dry-run
 
-# Start alerts; stop with Ctrl+C.
+# Start core notifications without inference; stop with Ctrl+C.
 node src/cli.js watch
+
+# Opt in to Luna answer suggestions.
+node src/cli.js watch --suggestions
 ```
 
 Exactly one matching session is selected automatically. If several tabs match, choose one interactively. Confirm the lecture title and session code in the initial `watching` line.
@@ -101,20 +116,39 @@ caffeinate -i node src/cli.js watch
 
 This does not prevent sleep when you close the laptop lid. Closing Terminal stops monitoring. If no matching session is open at startup, the command exits with an error; open it first, then rerun. `Ctrl+C` leaves your browser and tabs open and closes only the monitor's owned renderer.
 
+## Luna suggested answers
+
+Suggestions are **off by default**. Use `watch --suggestions` (or `npm start -- --suggestions`) to enable them. The initial status reports `suggestions` and `remoteAnswers: false`. Existing bot/chat settings still work; no configuration migration is needed. Restart an existing watcher to load the change. `--read-only` is still accepted as a compatibility flag; it does not turn suggestions off.
+
+Each question alert is sent first with `Suggested answer: generating…`. Once Telegram confirms delivery, a single background worker runs the local Codex CLI with **`gpt-6-luna`**, the captured question JPEG when available, extracted question text, and ordered choices. Luna returns the answer first and one or two short sentences of reasoning, with explicit uncertainty when information is insufficient. Suggestions consume your Codex inference usage/credits under your sign-in plan; see [model availability](https://learn.chatgpt.com/docs/models) and [pricing](https://learn.chatgpt.com/docs/pricing). The model is pinned; unavailable Luna access never causes a switch to another model.
+
+The worker appends the result to the original alert using a caption edit, or a text edit if Telegram received a fallback notice. The lecture, session, timestamp, and link stay intact. Output is plain text and safely truncated within Telegram's 1,024-character caption or 4,096-character message limit. Every question alert includes the public repository link. Suggestion-enabled alerts also show `Model: gpt-6-luna` and `AI suggestion; may be incorrect. Verify before use.` in generating, successful, and unavailable states. Space for the footer is reserved before truncating the answer. Newer questions do not cancel older generation jobs, and late results always update their own original messages.
+
+At most 100 jobs may be outstanding, with duplicate delivery receipts suppressed by alert ID. Missing CLI/authentication, generation errors, empty or oversized output, a 60-second timeout, or a full generation queue produce `Suggested answer unavailable.` while ordinary alerts continue. If image capture fails, usable extracted text can still produce a suggestion; an image-only question without a usable image cannot. Edits reuse delivery retries, honor rate limits, and treat an unchanged message as success. A permanent edit failure is logged without resending the question or regenerating its answer. An edit rejected because the delivery queue is full is also logged; its original placeholder may remain.
+
+Every generation runs in a private temporary directory. Its JPEG is stored with owner-only permissions. Codex runs without the shared daemon, ignores user configuration/rules, and disables shell execution, hooks, apps, plugins, subagents, and web search. `--ephemeral` suppresses saved session rollout files. Final output is captured in memory (64 KiB maximum); stderr is drained separately with only a bounded, redacted diagnostic tail retained. Shared authentication and existing Codex history are preserved. See [Codex non-interactive behavior](https://learn.chatgpt.com/docs/non-interactive-mode).
+
+On success, failure, timeout, overflow, or shutdown, the worker closes its owned process and removes its temporary directory before scheduling any edit. If necessary it terminates only its own process group, escalating from SIGTERM to SIGKILL after two seconds, including descendants that ignore SIGTERM. Ctrl+C/SIGTERM cancels active generation, discards pending jobs, and waits for cleanup. It leaves your Chrome tabs open. `watch --once` drains initial delivery, generation, and resulting edits before exiting. Dry runs never invoke Codex or Telegram; `--no-suggestions` never invokes Codex.
+
+Telegram submission is currently disabled. The answer controller, receiver, and browser submission helpers remain in the source for future work, but ordinary watching starts none of them and exposes no submission controls. Read the suggestion and enter any chosen response yourself in Wooclap.
+
 ## Commands
 
 | Command | Behavior |
 | --- | --- |
-| `setup` | Hidden local token entry, private-chat discovery, save settings, send test alert |
+| `setup` | Hidden local token entry, private/group discovery, save settings, send test alert |
 | `doctor` | Check config, Telegram bot/chat access, Chrome, and matching tabs; send no messages |
 | `tabs` | List NTULearn tabs with embedded Wooclap sessions |
-| `watch` | Check the selected session and send question/outage alerts |
-| `watch --dry-run` | Run detection and image capture without Telegram calls |
-| `watch --once` | One check, finish queued delivery, then exit |
+| `watch` | Send core question/outage alerts without inference |
+| `watch --suggestions` | Append optional Luna suggestions with model attribution and disclaimer |
+| `watch --no-suggestions` | Send basic alerts without Codex inference |
+| `watch --read-only` | Compatibility flag; submission is disabled in every watch mode |
+| `watch --dry-run` | Run detection and image capture without Telegram or Codex calls |
+| `watch --once` | One check, finish delivery, suggestions, and edits, then exit |
 | `--help` | Show commands and flags |
 
 Global flags: `--config <path>`, `--endpoint <channel-or-url>`, `--json`.
-Watch flags: `--session <code>`, `--tab <number>`, `--interval <seconds>`, `--dry-run`, `--once`.
+Watch flags: `--session <code>`, `--tab <number>`, `--interval <seconds>`, `--read-only`, `--suggestions`, `--no-suggestions`, `--dry-run`, `--once`.
 
 The default interval is 10 seconds; overrides must be at least one second. Checks do not overlap, so a slow read or capture can extend an interval.
 
@@ -125,7 +159,7 @@ Environment variables override saved settings. Explicit endpoint/interval flags 
 | Variable | Purpose |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Bot token, configured locally |
-| `TELEGRAM_CHAT_ID` | Numeric private chat ID |
+| `TELEGRAM_CHAT_ID` | Numeric private/group chat ID (groups are negative) |
 | `NTULEARN_MONITOR_CONFIG` | Alternate config JSON path |
 | `NTULEARN_CDP_ENDPOINT` | Chrome channel or existing CDP URL; default `chrome` |
 | `NTULEARN_POLL_SECONDS` | Check interval; default `10` |
@@ -143,11 +177,11 @@ ntulearn-watch --help
 
 - A question already active at startup alerts immediately. Repeated checks of that question do not alert again. An observed waiting/results state rearms detection for another appearance.
 - Visible question IDs take precedence for deduplication. Otherwise the tool hashes normalized content, excluding standalone timers and response counts. Loading and disconnection do not clear duplicate-suppression history.
-- Native screenshots use direct Chrome capture to avoid element stability waits. They cover the question panel or Wooclap main area and may include any response visible there. Images remain in memory during normal monitoring.
+- Native screenshots use direct Chrome capture to avoid element stability waits. They cover the question panel or Wooclap main area and may include any response visible there. Images are held in memory for alerts and temporarily written to the private generation directory when suggestions run.
 - If native capture fails, is obscured, or would cut off content, a controlled headless renderer creates a question card from an immutable semantic snapshot. KaTeX's MathML is retained once, including fractions, powers, and inequalities. Recreated images are labeled in the caption.
 - The renderer supports text/MathML questions. Image/video/unsupported graphical questions require a successful native screenshot; unsupported graphics are not silently omitted from recreated cards. The renderer blocks scripts and external resource requests.
 - Native capture has a 2-second deadline, fallback rendering 5 seconds, and the combined image operation 8 seconds. Images are checked against Telegram photo limits.
-- Each successful alert contains one image and a short lecture/time/link caption. If both image paths fail, or Telegram rejects the photo, a concise notice links to Wooclap. Detailed errors and alert IDs stay in Terminal.
+- Each successful alert contains one image and a short lecture/time/link caption. Suggestions add a placeholder followed by the generated answer in the same message. If both image paths fail, or Telegram rejects the photo, a concise notice links to Wooclap. Detailed errors and alert IDs stay in Terminal.
 - Delivery is queued independently of polling. Transient errors retry up to five times per part with backoff; Telegram rate limits are honored. Confirmed parts are not resent. A lost acknowledgment can still cause a duplicate, so exactly-once delivery is not guaranteed.
 - The in-memory queue holds at most 100 alerts. Stopping discards pending deliveries and deduplication history. Restarting on an active question sends a fresh alert.
 - After 60 seconds of unreadable/loading checks, the tool queues one outage notice and later one recovery notice. Network loss may also prevent those notices from arriving.
@@ -164,7 +198,7 @@ node src/cli.js --json tabs
 node src/cli.js --json watch --session ABCDEF --dry-run --once
 ```
 
-`doctor` returns `ready` and separate Telegram/Chrome checks. Its exit code is 1 when setup or a matching tab is missing. `tabs` returns a `tabs` array. `watch` emits selection, check, question, delivery, and health events. Question events include `screenshot`, `imageSource` (`native` or `recreated`), and capture diagnostics. Runtime failures emit an `error` event and exit nonzero. CLI argument/help/version output is handled by the parser; interactive setup does not support `--json`.
+`doctor` returns `ready` and separate Telegram/Chrome checks. Its exit code is 1 when setup or a matching tab is missing. `tabs` returns a `tabs` array. `watch` emits selection, check, question, delivery, health, and `suggestion-queued`/`suggestion-started`/`suggestion-completed`/`suggestion-failed` events. Generation events include the alert ID, with duration and failure category on completion. The initial `watching` event includes `remoteAnswers: false` and `suggestions`; question events include `screenshot`, `imageSource` (`native` or `recreated`), and capture diagnostics. Runtime failures emit an `error` event and exit nonzero. CLI argument/help/version output is handled by the parser; interactive setup does not support `--json`.
 
 ## Development and tests
 
@@ -181,7 +215,7 @@ Browser tests need installed Chrome. On a development/CI machine without Chrome,
 npx playwright install --with-deps chrome
 ```
 
-Unit tests cover state transitions, deduplication, configuration permissions, Telegram payloads/retries, image markup, timeouts, and cancellation. Browser tests use isolated temporary Chrome profiles and synthetic intercepted NTULearn/Wooclap pages. They cover cross-origin frames, moving panels, offscreen choices, overlays, MathML rendering, screenshots, reconnection behavior, and Ctrl+C. They do not use a real NTULearn account or send Telegram messages. All quiz examples and the preview image are synthetic.
+Unit tests cover state transitions, deduplication, configuration permissions, Telegram payloads/retries, suggestion limits, Unicode truncation, delayed edits, immutable question binding, image/text fallback, and a fake Codex executable. Worker tests exercise stdin/image input, ordering, duplicate receipts, missing CLI/auth, nonzero/empty/oversized output, queue saturation, timeouts, cancellation, and removal of temporary files and SIGTERM-ignoring process groups. Tests for the preserved submission/receiver helpers also remain. Browser tests use isolated temporary Chrome profiles and synthetic intercepted NTULearn/Wooclap pages. They cover frames, screenshots, MathML, successful submission, manual selections, changed/reordered questions, duplicate labels, custom radio controls, uncertain acknowledgment, and Ctrl+C. CLI tests use fake Codex and Telegram to verify default watching, edit retries, `--once` draining, `--dry-run`, `--read-only`, opt-in `--suggestions`, group destinations, and `--no-suggestions`, with no receiver or browser submission. They do not use a real NTULearn account or send Telegram messages. All quiz examples and the preview image are synthetic.
 
 To regenerate the synthetic preview:
 
@@ -189,7 +223,7 @@ To regenerate the synthetic preview:
 NTULEARN_TEST_PREVIEW=docs/example-question.jpg npm run test:browser
 ```
 
-Wooclap DOM changes may require updates to `src/detection.js`. Validate a live question in dry-run mode, then confirm its image reaches your own Telegram chat before relying on a session.
+Wooclap DOM changes may require updates to `src/detection.js`. A local live Luna smoke test using the synthetic JPEG in this repository returned the correct answer and left no job-owned temporary files. Suggestions may be incorrect; review them before entering your response in Wooclap.
 
 ## License
 

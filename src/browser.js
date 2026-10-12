@@ -1,4 +1,5 @@
 import { chromium } from 'playwright';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { extractDom, classifyObservation } from './detection.js';
 import { QuestionImageRenderer, validatePhoto, withDeadline } from './question-image.js';
 
@@ -105,7 +106,76 @@ export class BrowserSource {
   async read() {
     const selected = await this.resolve();
     const raw = await boundedRead(selected.frame);
-    return { ...classifyObservation(raw), visualSnapshot: raw.visualSnapshot, session: selected.code, sessionKey: selected.key, title: selected.title, link: selected.link, frame: selected.frame };
+    return { ...classifyObservation(raw), visualSnapshot: raw.visualSnapshot, answerState: raw.answerState, session: selected.code, sessionKey: selected.key, title: selected.title, link: selected.link, frame: selected.frame };
+  }
+  async submitAnswer(expected, index, { isCurrent = () => true, signal, confirmationMs = 3000 } = {}) {
+    let selected = false, submitStarted = false;
+    const guard = () => !this.closed && !signal?.aborted && isCurrent();
+    const matches = (current) => current.state === 'active' && current.fingerprint === expected.fingerprint &&
+      current.sessionKey === expected.sessionKey && current.answerState?.signature === expected.signature;
+    const acknowledged = (current) => Boolean(current.answerState?.submitted &&
+      !(current.answerState.questionId && expected.questionId && current.answerState.questionId !== expected.questionId) &&
+      !(current.answerState.questionSignature && expected.questionSignature &&
+        current.answerState.questionSignature !== expected.questionSignature && !current.answerState.confirmationOnly));
+    const preflight = async () => {
+      if (!guard()) return { code: 'expired' };
+      const current = await this.read();
+      if (!guard()) return { code: 'expired' };
+      if (current.sessionKey !== expected.sessionKey) return { code: 'expired' };
+      if (current.answerState?.submitted) return { code: acknowledged(current) ? 'already_answered' : 'expired' };
+      if (!matches(current)) return { code: 'expired' };
+      if (!current.answerState.supported || current.answerState.options.some((option) => !option.enabled)) return { code: 'unavailable' };
+      return { current };
+    };
+    try {
+      let check = await preflight();
+      if (check.code) return check;
+      if (check.current.answerState.options.some((option) => option.selected)) return { code: 'manual' };
+      const option = check.current.answerState.options[index];
+      if (!option) return { code: 'invalid' };
+      const radio = await check.current.frame.locator('[role="radio"], input[type="radio"]').nth(option.domIndex).elementHandle({ timeout: 1000 });
+      if (!radio) return { code: 'unavailable' };
+      try {
+        // Pin the node so an intervening rerender cannot retarget an nth locator.
+        check = await preflight();
+        if (check.code) return check;
+        if (check.current.answerState.options.some((item) => item.selected)) return { code: 'manual' };
+        if (!guard()) return { code: 'expired' };
+        selected = true; // A timed-out click can still have selected the option.
+        await radio.click({ timeout: 1500 });
+      } finally { await radio.dispose(); }
+      check = await preflight();
+      if (check.code) return { code: check.code === 'already_answered' ? 'submitted' : check.code };
+      const options = check.current.answerState.options;
+      if (!options[index]?.selected || options.some((item, position) => position !== index && item.selected)) return { code: 'conflict' };
+      if (!check.current.answerState.submit?.enabled) return { code: 'selected_only' };
+      const submitLocator = check.current.frame.getByRole('button', { name: /^Submit$/i }).filter({ visible: true });
+      if (await submitLocator.count() !== 1) return { code: 'selected_only' };
+      const submit = await submitLocator.elementHandle({ timeout: 1000 });
+      if (!submit) return { code: 'selected_only' };
+      try {
+        check = await preflight();
+        if (check.code) return { code: check.code === 'already_answered' ? 'submitted' : check.code };
+        if (!check.current.answerState.options[index]?.selected || check.current.answerState.options.some((item, position) => position !== index && item.selected)) return { code: 'conflict' };
+        if (!check.current.answerState.submit?.enabled || !(await submit.isEnabled())) return { code: 'selected_only' };
+        if (!guard()) return { code: 'expired' };
+        submitStarted = true;
+        await submit.click({ timeout: 1500 });
+      } finally { await submit.dispose(); }
+      const deadline = Date.now() + confirmationMs;
+      do {
+        if (!guard()) return { code: 'unconfirmed' };
+        const current = await this.read();
+        if (!guard()) return { code: 'unconfirmed' };
+        if (current.sessionKey === expected.sessionKey && acknowledged(current)) return { code: 'submitted' };
+        if (!matches(current)) return { code: 'unconfirmed' };
+        if (Date.now() >= deadline) break;
+        await sleep(Math.min(100, deadline - Date.now()), undefined, { signal });
+      } while (true);
+      return { code: 'unconfirmed' };
+    } catch (error) {
+      return { code: submitStarted ? 'unconfirmed' : selected ? 'selected_only' : 'unavailable', reason: error.message };
+    }
   }
   async captureNative(observation, { signal } = {}) {
     const check = () => { if (signal?.aborted || this.closed) throw new Error('Question image capture cancelled.'); };

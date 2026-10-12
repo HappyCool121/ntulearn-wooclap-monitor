@@ -16,8 +16,9 @@ test('config has ten-second default and environment overrides restricted saved s
     assert.equal(config.botToken, '99999:ENV'); assert.equal(config.chatId, '123'); assert.equal(config.intervalSeconds, 15); assert.equal(config.tokenSource, 'environment');
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
-test('invalid interval or group chat is rejected and credentials redact', async () => {
+test('invalid interval/chat IDs are rejected, groups accepted and credentials redact', async () => {
   await assert.rejects(loadConfig({ NTULEARN_POLL_SECONDS: 'NaN' }, '/no/such/file'), /Polling interval/);
-  assert.throws(() => requireTelegram({ botToken: '123:ABC', chatId: '-123' }), /private/);
+  assert.doesNotThrow(() => requireTelegram({ botToken: '123:ABC', chatId: '-1001234567890' }));
+  for (const chatId of ['0', '-0', 'abc', '1.5', '@group']) assert.throws(() => requireTelegram({ botToken: '123:ABC', chatId }), /numeric/);
   assert.equal(redact('token 123:ABC and bot123:ABC', '123:ABC'), 'token [REDACTED] and bot[REDACTED]');
 });

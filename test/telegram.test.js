@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Telegram, TelegramError, DeliveryQueue, questionParts, splitText, timestamp } from '../src/telegram.js';
+import { Telegram, TelegramError, DeliveryQueue, questionParts, suggestionEdit, splitText, timestamp } from '../src/telegram.js';
+import { requireDestinationChat } from '../src/telegram.js';
+import { REPOSITORY_URL, SUGGESTION_DISCLAIMER, SUGGESTION_MODEL } from '../src/constants.js';
 
 const token = '12345:TEST_TOKEN';
 const response = (status, data) => ({ ok: status < 400, status, json: async () => data });
@@ -10,8 +12,11 @@ test('Bot API sends multipart photos and JSON text', async () => {
   await bot.call('sendPhoto', { chat_id: '42', caption: 'Question' }, { photo: Buffer.from('jpeg') });
   assert.ok(calls[0].init.body instanceof FormData);
   assert.equal(calls[0].init.body.get('photo').type, 'image/jpeg');
+  const markup = { inline_keyboard: [[{ text: 'A', callback_data: 'wa:test-1:0' }]] };
+  await bot.call('sendPhoto', { chat_id: '42', reply_markup: markup }, { photo: Buffer.from('jpeg') });
+  assert.deepEqual(JSON.parse(calls[1].init.body.get('reply_markup')), markup);
   await bot.call('sendMessage', { chat_id: '42', text: 'hello' });
-  assert.equal(JSON.parse(calls[1].init.body).text, 'hello');
+  assert.equal(JSON.parse(calls[2].init.body).text, 'hello');
 });
 test('Telegram rate limit is retryable and retry_after is respected', async () => {
   const bot = new Telegram(token, '42', { fetchImpl: async () => response(429, { ok: false, error_code: 429, parameters: { retry_after: 12 } }) });
@@ -98,4 +103,103 @@ test('retry budget is bounded and cancellation aborts in-flight requests', async
   const stalled = new DeliveryQueue({ chatId: '42', call: async (_method, _params, { signal }) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true })) });
   stalled.enqueue([{ method: 'sendMessage', params: {} }], 'q2');
   await stalled.close(); assert.equal(stalled.items.length, 0);
+});
+test('delivery exposes confirmed receipts without resending if receipt handling fails', async () => {
+  let calls = 0; const receipts = [];
+  const queue = new DeliveryQueue({ chatId: '42', call: async () => { calls++; return { message_id: 123, chat: { id: 42 } }; } });
+  queue.enqueue([{ method: 'sendPhoto', params: {} }], 'q1', { onSent: (receipt, part) => {
+    receipts.push({ receipt, part }); throw new Error('receipt handler failed');
+  } });
+  await queue.idle(); assert.equal(calls, 1); assert.equal(receipts[0].receipt.message_id, 123); assert.equal(receipts[0].part.method, 'sendPhoto');
+});
+
+test('suggestions retain metadata and truncate Unicode safely to caption/text limits', () => {
+  const event = { title: '😀'.repeat(200), session: 'X'.repeat(100), link: 'x'.repeat(600), detectedAt: new Date(), photo: Buffer.from('jpeg'), imageSource: 'recreated' };
+  const [photo] = questionParts(event, { suggestions: true });
+  assert.match(photo.params.caption, /Suggested answer: generating…/);
+  assert.ok(photo.params.caption.length <= 1024);
+  for (const part of [photo, photo.fallback]) {
+    const job = { deliveryType: part.method, messageId: 73, base: part.suggestionBase };
+    const edit = suggestionEdit(job, '😀'.repeat(5000));
+    const text = edit.params.caption || edit.params.text;
+    assert.equal(edit.params.message_id, 73);
+    assert.ok(text.startsWith(part.suggestionBase + '\n\nSuggested answer: '));
+    assert.ok(text.length <= (part.method === 'sendPhoto' ? 1024 : 4096));
+    assert.ok(text.includes('…')); assert.ok(!/[\uD800-\uDBFF]…/.test(text));
+    assert.equal(text.split(REPOSITORY_URL).length, 2);
+    assert.match(text, new RegExp(`Model: ${SUGGESTION_MODEL}`));
+    assert.ok(text.includes(SUGGESTION_DISCLAIMER));
+    assert.equal(edit.params.parse_mode, undefined); assert.equal(edit.params.reply_markup, undefined);
+    assert.equal(edit.method, part.method === 'sendPhoto' ? 'editMessageCaption' : 'editMessageText');
+    assert.match(suggestionEdit(job, null).params.caption || suggestionEdit(job, null).params.text, /Suggested answer unavailable\./);
+  }
+});
+
+test('setup discovers private/group/supergroup destinations and excludes departed bots and channels', async () => {
+  const requests = [];
+  const bot = new Telegram(token, '', { fetchImpl: async (url, init) => {
+    requests.push(JSON.parse(init.body));
+    return response(200, { ok: true, result: url.endsWith('getWebhookInfo') ? { url: '' } : [
+      { message: { chat: { id: 42, type: 'private', first_name: 'Owner' } } },
+      { message: { chat: { id: -5, type: 'group', title: 'Lecture group' } } },
+      { my_chat_member: { chat: { id: -1001234567890, type: 'supergroup', title: 'Lecture supergroup' }, new_chat_member: { status: 'member' } } },
+      { message: { chat: { id: -6, type: 'group', title: 'Left group' } } },
+      { my_chat_member: { chat: { id: -6, type: 'group' }, new_chat_member: { status: 'left' } } },
+      { my_chat_member: { chat: { id: -7, type: 'channel' }, new_chat_member: { status: 'administrator' } } },
+    ] });
+  } });
+  const chats = await bot.destinationChats();
+  assert.deepEqual(chats.map((chat) => chat.id), ['42', '-5', '-1001234567890']);
+  assert.match(chats[1].label, /Lecture group · group \[-5\]/);
+  assert.deepEqual(requests[1].allowed_updates, ['message', 'my_chat_member']);
+  assert.equal(requests[1].offset, undefined);
+  for (const type of ['private', 'group', 'supergroup']) assert.doesNotThrow(() => requireDestinationChat({ type }));
+  assert.throws(() => requireDestinationChat({ type: 'channel' }), /channels are not supported/);
+});
+
+test('basic, generating and unavailable alerts preserve the repository footer', () => {
+  for (const photo of [undefined, Buffer.from('jpeg')]) {
+    for (const suggestions of [false, true]) {
+      const [part] = questionParts({ title: 'Lecture', session: 'ABCDEF', link: 'https://app.wooclap.com/ABCDEF', photo }, { suggestions });
+      const text = part.params.caption || part.params.text;
+      assert.ok(text.endsWith(`Source: ${REPOSITORY_URL}`));
+      assert.equal(text.includes(SUGGESTION_DISCLAIMER), suggestions);
+      if (suggestions) {
+        const edit = suggestionEdit({ base: part.suggestionBase, deliveryType: part.method, messageId: 1 }, null);
+        const unavailable = edit.params.caption || edit.params.text;
+        assert.ok(unavailable.includes(SUGGESTION_DISCLAIMER));
+        assert.ok(unavailable.endsWith(`Source: ${REPOSITORY_URL}`));
+      }
+    }
+  }
+});
+
+test('group migration logs the replacement ID without retrying the old destination as text', async () => {
+  const calls = [], logs = [];
+  const bot = new Telegram(token, '-5', { fetchImpl: async (url) => {
+    calls.push(url.split('/').at(-1));
+    return response(400, { ok: false, error_code: 400, parameters: { migrate_to_chat_id: -1001234567890 } });
+  } });
+  const queue = new DeliveryQueue(bot, { log: (event, detail) => logs.push({ event, ...detail }) });
+  queue.enqueue(questionParts({ photo: Buffer.from('jpeg') }), 'q1'); await queue.idle();
+  assert.deepEqual(calls, ['sendPhoto']);
+  assert.match(logs[0].reason, /setup with --chat -1001234567890/);
+});
+
+test('unchanged edit succeeds and edit retries never resend a question', async () => {
+  const bot = new Telegram(token, '42', { fetchImpl: async () => response(400, { ok: false, error_code: 400, description: 'Bad Request: message is not modified: specified new message content is the same' }) });
+  assert.equal(await bot.call('editMessageCaption'), true);
+  await assert.rejects(bot.call('sendMessage'), { code: 400 });
+  const calls = []; let edits = 0;
+  const queue = new DeliveryQueue({ chatId: '42', call: async (method) => {
+    calls.push(method);
+    if (method === 'editMessageCaption' && ++edits < 3) throw new TelegramError('transient', { retryable: true });
+    if (method === 'editMessageText') throw new TelegramError('permanent', { code: 400 });
+  } }, { wait: async () => {} });
+  queue.enqueue([{ method: 'sendPhoto', params: {} }], 'q1');
+  queue.enqueue([{ method: 'editMessageCaption', params: {} }], 'suggestion-q1');
+  queue.enqueue([{ method: 'editMessageText', params: {} }], 'suggestion-q2');
+  queue.enqueue([{ method: 'sendPhoto', params: {} }], 'q3');
+  await queue.idle();
+  assert.deepEqual(calls, ['sendPhoto', 'editMessageCaption', 'editMessageCaption', 'editMessageCaption', 'editMessageText', 'sendPhoto']);
 });

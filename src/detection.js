@@ -13,6 +13,7 @@ export function extractDom() {
   const main = all(document, 'main, [role="main"]')[0] || document.body;
   const panels = all(main, '[data-question-id], [data-testid="question"], [data-testid="question-container"], [data-testid="question-panel"], [data-testid="active-question"], [data-question-state="active"], .question-container, .question-panel');
   const panel = panels[0] || main;
+  const questionIdNode = panel.matches('[data-question-id]') ? panel : all(panel, '[data-question-id]')[0];
   const statuses = all(main, '[role="status"], [role="alert"], [data-testid="waiting-screen"], [data-testid="results-screen"]').map(text);
   const headings = all(panel, 'h1, h2, h3, [role="heading"], [data-testid="question-title"], [data-testid="question-text"], .question-title, .question-text').map(text).filter(Boolean);
   const controls = all(panel, 'input:not([type="hidden"]):not([type="password"]):not([type="search"]), textarea, select, [role="radio"], [role="checkbox"], [role="textbox"], [role="slider"], [contenteditable="true"]')
@@ -24,13 +25,45 @@ export function extractDom() {
   const optionButtons = buttons.map(text).filter((value) => value && !utility.test(value));
   const choices = [...new Set(choiceNodes.map(text).filter(Boolean))];
   if (!choices.length && optionButtons.length >= 2) choices.push(...optionButtons);
+  const radioSelector = '[role="radio"], input[type="radio"]';
+  const allRadios = [...document.querySelectorAll(radioSelector)];
+  const radios = all(panel, radioSelector).filter((node) => !node.parentElement?.closest('[role="radio"]'));
+  const radioLabel = (node) => node.matches('input') ? (node.labels?.[0] || node) : node;
+  const groups = [];
+  const answerOptions = radios.map((node) => {
+    const group = node.closest('[role="radiogroup"], fieldset') || panel;
+    if (!groups.includes(group)) groups.push(group);
+    return {
+      domIndex: allRadios.indexOf(node), text: text(radioLabel(node)),
+      key: node.id || node.getAttribute('data-answer-id') || node.getAttribute('value') || '',
+      group: `${groups.indexOf(group)}:${node.matches('input') ? node.getAttribute('name') || '' : 'aria'}`,
+      selected: Boolean(node.checked || node.querySelector('input[type="radio"]')?.checked || node.getAttribute('aria-checked') === 'true'),
+      enabled: !node.disabled && !node.querySelector('input[type="radio"]')?.disabled && node.getAttribute('aria-disabled') !== 'true',
+    };
+  });
+  if (radios.length) choices.splice(0, choices.length, ...answerOptions.map((option) => option.text));
+  const allButtons = [...document.querySelectorAll('button, [role="button"]')];
+  const submitButtons = all(panel, 'button, [role="button"]').filter((node) => /^submit$/i.test(text(node)));
+  const submittedText = /^(?:your (?:answer|response) (?:has been|was|is) (?:sent|submitted|recorded)|answer submitted|response (?:submitted|recorded)|thanks for your (?:answer|response))(?:[.! ]|$)/i;
+  const submitted = statuses.some((value) => submittedText.test(value.trim())) ||
+    text(main).split('\n').some((value) => submittedText.test(value.trim())) ||
+    all(main, '[data-testid="answer-submitted"], [data-answer-state="submitted"]').length > 0;
+  const answerState = {
+    supported: radios.length >= 2 && radios.length <= 26 && new Set(answerOptions.map((option) => option.group)).size === 1 &&
+      submitButtons.length === 1 && !all(panel, '[role="checkbox"], input:not([type="radio"]):not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, [contenteditable="true"]').length,
+    options: answerOptions,
+    signature: JSON.stringify({ question: headings, options: answerOptions.map(({ domIndex, text, key, group }) => ({ domIndex, text, key, group })) }),
+    questionSignature: JSON.stringify(headings), questionId: questionIdNode?.getAttribute('data-question-id') || '',
+    confirmationOnly: headings.length === 0 || headings.every((value) => submittedText.test(value.trim()) || /^results[.!]?$/i.test(value.trim())),
+    submitted,
+    submit: submitButtons.length === 1 ? { domIndex: allButtons.indexOf(submitButtons[0]), enabled: !submitButtons[0].disabled && submitButtons[0].getAttribute('aria-disabled') !== 'true' } : null,
+  };
   const images = all(panel, 'img:not([alt="Wooclap"]), svg[role="img"], canvas').filter((el) => {
     const rect = el.getBoundingClientRect();
     return rect.width >= 80 && rect.height >= 40;
   }).map((el) => ({ alt: el.getAttribute('alt') || el.getAttribute('aria-label') || '', src: el.getAttribute('src') || '', kind: el.tagName.toLowerCase() }));
   const explicitActive = panel.matches('[data-testid="active-question"], [data-question-state="active"]') ||
     !!all(panel, '[data-testid="active-question"], [data-question-state="active"]')[0];
-  const questionIdNode = panel.matches('[data-question-id]') ? panel : all(panel, '[data-question-id]')[0];
   // A semantic snapshot is separate from detection/fingerprinting. Keep one
   // MathML representation of KaTeX, never its duplicate visual/TeX layers.
   let unsupported = images.length ? 'Question contains images or graphics that cannot be recreated faithfully.' : '';
@@ -61,8 +94,8 @@ export function extractDom() {
   };
   const headingNode = all(panel, 'h1, h2, h3, [role="heading"], [data-testid="question-title"], [data-testid="question-text"], .question-title, .question-text')
     .find((node) => text(node) && !/^(wooclap|question|multiple choice|open question)$/i.test(text(node)));
-  const visualChoices = choices.map((value) => {
-    const node = [...choiceNodes, ...buttons].find((candidate) => text(candidate) === value);
+  const visualChoices = choices.map((value, index) => {
+    const node = radios.length ? radioLabel(radios[index]) : [...choiceNodes, ...buttons].find((candidate) => text(candidate) === value);
     return node ? serialize(node) : { text: value };
   });
   const visualQuestion = headingNode ? serialize(headingNode) : null;
@@ -75,7 +108,7 @@ export function extractDom() {
     explicitActive,
     loading: !!all(main, '[aria-busy="true"], [role="progressbar"], [data-testid="loading"]')[0],
     results: !!all(main, '[data-testid="results-screen"], [data-question-state="results"]')[0],
-    visualSnapshot,
+    visualSnapshot, answerState,
   };
 }
 
@@ -91,6 +124,7 @@ export function classifyObservation(raw) {
   const unavailable = /^(?:connection lost|disconnected|reconnecting|session expired|sign in to continue|log in to continue|event not found|event has ended|session has ended|you are offline)(?:[.! ]|$)/i;
   if (unavailable.test(stateText) || lines.some((line) => unavailable.test(line))) return { state: 'unavailable', reason: 'Wooclap connection/session unavailable' };
   if (raw.loading) return { state: 'loading', reason: 'Wooclap is loading' };
+  if (raw.answerState?.submitted) return { state: 'results' };
   const resultLine = /^(?:results|correct answer|voting (?:is )?closed|question (?:is )?closed|leaderboard|your answer has been (?:sent|submitted)|answer submitted|thanks for your (?:answer|response))(?:[.! :]|$)/i;
   if (raw.results || resultLine.test(stateText) || lines.some((line) => resultLine.test(line))) return { state: 'results' };
   const headings = (raw.headings || []).flatMap(contentLines).filter((line) => !/^(?:wooclap|question|multiple choice|open question)$/i.test(line));
