@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
@@ -114,11 +115,11 @@ for (const [mode, category] of [['nonzero', 'generation-error'], ['auth', 'authe
     const { worker, directory, root, logs } = await fixture(t, { timeoutMs: mode === 'wait' ? 600 : 3000 });
     const record = join(root, 'record.json');
     const results = []; let files;
-    worker.enqueue(job(mode, { mode, record }), (answer) => { results.push(answer); files = readdir(directory); });
+    worker.enqueue(job(mode, { mode, record }), (answer) => { results.push(answer); files = readdirSync(directory); });
     worker.enqueue(job('next'), (answer) => results.push(answer));
     await worker.idle();
     assert.equal(results[0], null); assert.ok(results[1]);
-    assert.deepEqual(await files, []);
+    assert.deepEqual(files, []);
     assert.equal(logs.find((log) => log.alertId === mode && log.event === 'suggestion-failed').category, category);
     await assertGone(JSON.parse(await readFile(record, 'utf8')).pid);
     assert.deepEqual(await readdir(directory), []);
