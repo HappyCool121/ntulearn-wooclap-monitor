@@ -50,13 +50,24 @@ export class Monitor {
       // Keep the original question even if the live page changes during delivery/generation.
       const question = Object.freeze({ prompt: String(event.prompt || ''), choices: Object.freeze([...(event.choices || [])]), photo: event.photo ? Buffer.from(event.photo) : undefined });
       const parts = questionParts(event, { suggestions: Boolean(this.suggestions) });
+      const deliveries = new Map();
+      let generating = false, completed = false, result;
+      const edit = (job) => this.queue.enqueue([suggestionEdit(job, result)], `suggestion-${job.alertId}`);
       this.queue.enqueue(this.answers ? this.answers.decorate(parts, binding) : parts, event.alertId, {
         onSent: (receipt, part) => {
           this.answers?.receipt(binding, receipt);
           if (!this.suggestions || !receipt?.message_id) return;
-          const job = Object.freeze({ ...question, alertId: event.alertId, messageId: receipt.message_id, deliveryType: part.method, base: part.suggestionBase });
+          const chatId = part.params.chat_id ?? receipt.chat?.id ?? this.queue.telegram?.chatId;
+          const key = `${chatId}:${receipt.message_id}`;
+          if (deliveries.has(key)) return;
+          const job = Object.freeze({ ...question, alertId: event.alertId, chatId, messageId: receipt.message_id, deliveryType: part.method, base: part.suggestionBase });
+          deliveries.set(key, job);
+          if (completed) { edit(job); return; }
+          if (generating) return;
+          generating = true;
           this.suggestions.enqueue(job, (suggestion) => {
-            this.queue.enqueue([suggestionEdit(job, suggestion)], `suggestion-${job.alertId}`);
+            result = suggestion; completed = true;
+            for (const delivered of deliveries.values()) edit(delivered);
           });
         },
       });

@@ -11,7 +11,7 @@ test('one receiver per bot; different bots can run and release locks', async () 
   const dir = await temporary();
   try {
     const release = await acquireBotLock('123:TEST_ONLY', dir);
-    await assert.rejects(acquireBotLock('123:TEST_ONLY', dir), /Another answer receiver/);
+    await assert.rejects(acquireBotLock('123:TEST_ONLY', dir), /Another Telegram receiver/);
     const other = await acquireBotLock('456:OTHER_TEST', dir); await other(); await release();
     assert.deepEqual(await readdir(dir), []);
   } finally { await rm(dir, { recursive: true, force: true }); }

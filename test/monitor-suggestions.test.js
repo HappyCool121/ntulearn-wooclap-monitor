@@ -67,3 +67,48 @@ test('dry runs and basic alerts never enqueue generation or expose answer contro
   assert.equal(calls.length, 1); assert.doesNotMatch(calls[0].params.caption, /Suggested answer/);
   assert.equal(calls[0].params.reply_markup, undefined);
 });
+
+for (const immediate of [false, true]) {
+  test(`broadcast shares one ${immediate ? 'immediate' : 'delayed'} suggestion across duplicate message IDs and photo/text fallbacks`, async () => {
+    const calls = [], jobs = [];
+    let done;
+    const telegram = { chatId: '42', call: async (method, params) => {
+      calls.push({ method, params });
+      if (method === 'sendPhoto' && params.chat_id === '-20') throw new TelegramError('bad photo', { code: 400 });
+      return { message_id: 7, chat: { id: Number(params.chat_id) } };
+    } };
+    const queue = new DeliveryQueue(telegram, { destinations: () => ['42', '-10', '-20', '-10'] });
+    const suggestions = { enqueue: (job, callback) => {
+      jobs.push(job); done = callback;
+      if (immediate) callback('B — 5. Five is prime.');
+    } };
+    const monitor = new Monitor({ read: async () => question('q1'), screenshot: async () => Buffer.from('jpeg') }, queue, { suggestions });
+    await monitor.tick(); await queue.idle();
+    assert.equal(jobs.length, 1);
+    if (!immediate) { done('B — 5. Five is prime.'); await queue.idle(); }
+    const edits = calls.filter((call) => call.method.startsWith('editMessage'));
+    assert.deepEqual(edits.map((call) => [call.params.chat_id, call.params.message_id, call.method]), [
+      ['42', 7, 'editMessageCaption'], ['-10', 7, 'editMessageCaption'], ['-20', 7, 'editMessageText'],
+    ]);
+    assert.ok(edits.every((call) => /Suggested answer: B — 5/.test(call.params.caption || call.params.text)));
+    assert.ok(calls.every((call) => call.params.reply_markup === undefined));
+    await queue.close();
+  });
+}
+
+test('broadcast failed destination does not prevent later deliveries or multiply unavailable generation', async () => {
+  const calls = []; let generations = 0;
+  const queue = new DeliveryQueue({ chatId: '42', call: async (method, params) => {
+    calls.push({ method, params });
+    if (params.chat_id === '-10') throw new TelegramError('removed', { code: 403 });
+    return { message_id: 1 };
+  } }, { destinations: () => ['-10', '-20', '42'] });
+  const source = { read: async () => question('q1'), screenshot: async () => Buffer.from('jpeg') };
+  const suggestions = { enqueue: (_job, done) => { generations++; done(null); } };
+  await new Monitor(source, queue, { suggestions }).tick(); await queue.idle();
+  assert.equal(generations, 1);
+  const edits = calls.filter((call) => call.method.startsWith('editMessage'));
+  assert.deepEqual(edits.map((call) => call.params.chat_id), ['-20', '42']);
+  assert.ok(edits.every((call) => /Suggested answer unavailable\./.test(call.params.caption)));
+  await queue.close();
+});

@@ -99,6 +99,7 @@ export function suggestionText(base, suggestion, limit) {
 export function suggestionEdit(job, suggestion) {
   const photo = job.deliveryType === 'sendPhoto';
   return { method: photo ? 'editMessageCaption' : 'editMessageText', params: {
+    ...(job.chatId ? { chat_id: job.chatId } : {}),
     message_id: job.messageId,
     [photo ? 'caption' : 'text']: suggestionText(job.base, suggestion, photo ? 1024 : 4096),
     ...(!photo ? { link_preview_options: { is_disabled: true } } : {}),
@@ -131,14 +132,24 @@ export function questionParts(event, { suggestions = false } = {}) {
 // Serial delivery resumes at the first unconfirmed part after a failure.
 // Polling enqueues work without awaiting this worker.
 export class DeliveryQueue {
-  constructor(telegram, { log = () => {}, wait = sleep, maxAttempts = 5, maxPending = 100 } = {}) {
+  constructor(telegram, { log = () => {}, wait = sleep, maxAttempts = 5, maxPending = 100,
+    destinations = null, isDestination = null, onFailure = null } = {}) {
     this.telegram = telegram; this.log = log; this.wait = wait;
     this.maxAttempts = maxAttempts; this.maxPending = maxPending;
+    this.destinations = destinations; this.isDestination = isDestination; this.onFailure = onFailure;
     this.items = []; this.running = null; this.stopped = false;
     this.abort = new AbortController();
   }
   enqueue(parts, label, { onSent } = {}) {
     if (this.stopped) return false;
+    if (this.destinations && parts.every((part) => part.params.chat_id === undefined)) {
+      let accepted = false;
+      const bind = (part, id) => ({ ...part, params: { ...part.params, chat_id: id }, ...(part.fallback ? { fallback: bind(part.fallback, id) } : {}) });
+      for (const id of new Set(this.destinations().map(String))) {
+        accepted = this.enqueue(parts.map((part) => bind(part, id)), `${label}@${id}`, { onSent }) || accepted;
+      }
+      return accepted;
+    }
     if (this.items.length >= this.maxPending) { this.log('delivery-failed', { label, reason: 'Delivery queue full; alert not queued.' }); return false; }
     this.items.push({ parts, label, onSent });
     this.kick(); return true;
@@ -157,6 +168,11 @@ export class DeliveryQueue {
       for (let part of item.parts) {
         let sent = false;
         for (let attempt = 1; attempt <= this.maxAttempts && !this.stopped; attempt++) {
+          const chatId = String(part.params.chat_id ?? this.telegram.chatId);
+          if (this.isDestination && !this.isDestination(chatId)) {
+            this.log('delivery-skipped', { label: item.label, chatId, reason: 'Destination is no longer registered.' });
+            break;
+          }
           try {
             const receipt = await this.telegram.call(part.method, { chat_id: this.telegram.chatId, ...part.params }, { photo: part.photo, signal: this.abort.signal });
             sent = true;
@@ -166,6 +182,13 @@ export class DeliveryQueue {
             break;
           } catch (error) {
             if (this.stopped) break;
+            let migrated;
+            try { migrated = await this.onFailure?.(error, chatId); }
+            catch (failure) { this.log('destination-update-failed', { label: item.label, reason: failure.message }); }
+            if (migrated && /^send/.test(part.method) && attempt < this.maxAttempts) {
+              const bind = (value) => ({ ...value, params: { ...value.params, chat_id: migrated }, ...(value.fallback ? { fallback: bind(value.fallback) } : {}) });
+              part = bind(part); continue;
+            }
             if (part.fallback && error.code === 400 && !error.migrateToChatId) {
               this.log('photo-fallback', { label: item.label });
               part = part.fallback; attempt = 0; continue;

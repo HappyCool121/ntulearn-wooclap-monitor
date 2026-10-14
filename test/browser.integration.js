@@ -241,7 +241,7 @@ test('real Chrome iframe extraction, screenshots, standalone CLI, and disconnect
       await set(waiting);
       const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
       for (const mode of ['', '--dry-run', '--read-only', '--once', '--no-suggestions']) {
-      const child = spawn(process.execPath, [cli, '--endpoint', endpoint, '--json', 'watch', ...(mode ? [mode] : []), '--interval', '1'], {
+      const child = spawn(process.execPath, [cli, '--endpoint', endpoint, '--json', 'watch', '--no-auto-groups', ...(mode ? [mode] : []), '--interval', '1'], {
         stdio: ['ignore', 'pipe', 'pipe'], cwd: tmpdir(),
         env: { ...process.env, TELEGRAM_BOT_TOKEN: '12345:TEST_ONLY', TELEGRAM_CHAT_ID: '42', NTULEARN_MONITOR_CONFIG: join(profile, 'unused-config.json') },
       });
@@ -260,7 +260,7 @@ test('real Chrome iframe extraction, screenshots, standalone CLI, and disconnect
       assert.equal((await source.read()).state, 'waiting');
       }
     });
-    await t.test('standalone watch drains Luna edits on --once, supports basic/dry modes, and never receives or submits answers', async () => {
+    await t.test('standalone watch registers groups, broadcasts Luna edits on --once, supports basic/dry modes, and never submits answers', async () => {
       await interactive();
       const bin = join(profile, 'bin'); await mkdir(bin);
       const record = join(profile, 'codex-record.json');
@@ -279,11 +279,26 @@ process.stdin.on('end', () => {
 `, { mode: 0o700 });
       await writeFile(preload, `
 import { appendFileSync } from 'node:fs';
-let edits = 0;
+let edits = 0, polled = false;
 globalThis.fetch = async (url, init) => {
  const method = url.split('/').at(-1);
  const params = init.body instanceof FormData ? Object.fromEntries([...init.body].filter(([key]) => key !== 'photo')) : JSON.parse(init.body);
  appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ method, params }) + '\\n');
+ if (method === 'getWebhookInfo') return { ok: true, status: 200, json: async () => ({ ok: true, result: { url: '' } }) };
+ if (method === 'getMe') return { ok: true, status: 200, json: async () => ({ ok: true, result: { id: 12345, username: 'test_bot' } }) };
+ if (method === 'getChatMember') return { ok: true, status: 200, json: async () => ({ ok: true, result: { status: 'member' } }) };
+ if (method === 'getChat') return { ok: true, status: 200, json: async () => ({ ok: true, result: { id: Number(params.chat_id), type: 'supergroup', title: 'Test group' } }) };
+ if (method === 'getUpdates') {
+   if (!polled) {
+     polled = true;
+     const updates = process.env.TEST_GROUPS ? [-1009871, -1009872].map((id, i) => ({ update_id: i + 1, my_chat_member: { chat: { id, type: 'supergroup', title: 'Test group' }, new_chat_member: { user: { id: 12345 }, status: 'member' } } })) : [];
+     return { ok: true, status: 200, json: async () => ({ ok: true, result: updates }) };
+   }
+   return new Promise((resolve, reject) => {
+     const timer = setTimeout(() => resolve({ ok: true, status: 200, json: async () => ({ ok: true, result: [] }) }), 20000);
+     init.signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+   });
+ }
  if (!['sendPhoto', 'sendMessage', 'editMessageCaption', 'editMessageText'].includes(method)) throw new Error('Unexpected receiver/API call ' + method);
  if (method === 'sendPhoto' && process.env.TEST_PHOTO_FALLBACK) return { ok: false, status: 400, json: async () => ({ ok: false, error_code: 400, description: 'invalid photo' }) };
  if (method.startsWith('editMessage') && ++edits === 1) return { ok: false, status: 429, json: async () => ({ ok: false, error_code: 429, description: 'retry', parameters: { retry_after: 0 } }) };
@@ -293,16 +308,20 @@ globalThis.fetch = async (url, init) => {
       const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
       for (const scenario of [
         { flags: ['--once', '--suggestions'], suggestions: true },
+        { flags: ['--once', '--suggestions'], suggestions: true, groups: true },
         { flags: ['--suggestions'], suggestions: true, continuous: true },
         { flags: ['--once', '--read-only', '--suggestions'], suggestions: true, fallback: true, chatId: '-1001234567890' },
         { flags: ['--once'], suggestions: false },
+        { flags: ['--once', '--no-auto-groups'], suggestions: false, legacy: true },
         { flags: ['--once', '--suggestions', '--no-suggestions'], suggestions: false },
         { flags: ['--once', '--suggestions', '--dry-run'], suggestions: false, dry: true },
       ]) {
         await rm(record, { force: true }); await rm(callsFile, { force: true });
+        const { groupStatePath } = await import('../src/groups.js');
+        await rm(groupStatePath({ path: join(profile, 'unused-config.json'), botToken: '12345:TEST_ONLY' }), { force: true });
         const child = spawn(process.execPath, ['--import', preload, cli, '--endpoint', endpoint, '--json', 'watch', ...scenario.flags, '--interval', '1'], {
           stdio: ['ignore', 'pipe', 'pipe'], cwd: tmpdir(),
-          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TELEGRAM_BOT_TOKEN: '12345:TEST_ONLY', TELEGRAM_CHAT_ID: scenario.chatId || '42', NTULEARN_MONITOR_CONFIG: join(profile, 'unused-config.json'), TEST_PHOTO_FALLBACK: scenario.fallback ? '1' : '' },
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TELEGRAM_BOT_TOKEN: '12345:TEST_ONLY', TELEGRAM_CHAT_ID: scenario.chatId || '42', NTULEARN_MONITOR_CONFIG: join(profile, 'unused-config.json'), TEST_PHOTO_FALLBACK: scenario.fallback ? '1' : '', TEST_GROUPS: scenario.groups ? '1' : '' },
         });
         let output = '', error = '', signalled = false;
         child.stdout.on('data', (data) => {
@@ -317,20 +336,26 @@ globalThis.fetch = async (url, init) => {
         const events = output.trim().split('\n').map((line) => JSON.parse(line));
         const watching = events.find((event) => event.event === 'watching');
         assert.equal(watching.remoteAnswers, false); assert.equal(watching.suggestions, scenario.suggestions);
+        assert.equal(watching.automaticGroups, !scenario.dry && !scenario.legacy);
         assert.ok(events.every((event) => !event.event.startsWith('receiver')));
         assert.equal(await frame.evaluate(() => window.testSubmits), 0);
         assert.equal(await frame.locator('input:checked').count(), 0);
         if (scenario.dry) {
           await assert.rejects(readFile(callsFile), { code: 'ENOENT' });
         } else {
-          const calls = (await readFile(callsFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+          const allCalls = (await readFile(callsFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+          const calls = allCalls.filter((call) => ['sendPhoto', 'sendMessage', 'editMessageCaption', 'editMessageText'].includes(call.method) && !call.params.text?.startsWith('Wooclap alerts are connected'));
           assert.ok(calls.every((call) => call.params.reply_markup === undefined));
-          assert.ok(calls.every((call) => call.params.chat_id === (scenario.chatId || '42')));
+          const ids = scenario.groups ? ['42', '-1009871', '-1009872'] : [scenario.chatId || '42'];
+          assert.ok(calls.every((call) => ids.includes(call.params.chat_id)));
           assert.ok(calls.every((call) => (call.params.caption || call.params.text).includes('Source: https://github.com/HappyCool121/ntulearn-wooclap-monitor')));
-          assert.equal(calls.filter((call) => call.method === 'sendPhoto').length, 1);
+          assert.equal(calls.filter((call) => call.method === 'sendPhoto').length, ids.length);
+          assert.equal(allCalls.some((call) => call.method === 'getUpdates'), !scenario.legacy);
           if (scenario.suggestions) {
             const editMethod = scenario.fallback ? 'editMessageText' : 'editMessageCaption';
-            assert.equal(calls.filter((call) => call.method === editMethod).length, 2, 'edit rate limit retried before process exited');
+            assert.equal(calls.filter((call) => call.method === editMethod).length, ids.length + 1, 'edit rate limit retried before process exited');
+            assert.deepEqual([...new Set(calls.filter((call) => call.method === editMethod).map((call) => call.params.chat_id))], ids);
+            assert.equal(events.filter((event) => event.event === 'suggestion-started').length, 1);
             assert.equal(calls.at(-1).params.message_id, 321);
             assert.match(calls.at(-1).params.caption || calls.at(-1).params.text, /Suggested answer: B — 5/);
             assert.match(calls[0].params.caption, /Suggested answer: generating…/);

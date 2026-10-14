@@ -6,6 +6,9 @@ import { connectBrowser, discoverTabs, publicTab, BrowserSource, CHROME_SETUP } 
 import { Telegram, DeliveryQueue, timestamp, requireDestinationChat } from './telegram.js';
 import { Monitor } from './monitor.js';
 import { CodexSuggestions } from './codex-suggestions.js';
+import { GroupRegistry, GroupListener, groupStatePath } from './groups.js';
+import { acquireBotLock } from './telegram-receiver.js';
+import { dirname, join } from 'node:path';
 
 const program = new Command();
 program.name('ntulearn-watch').description('Monitor Wooclap with Telegram image alerts and Luna answer suggestions.').version('1.0.0')
@@ -32,6 +35,18 @@ function emit(event, detail = {}) {
   }
 }
 
+function groupDelivery(value, onFatal) {
+  const telegram = new Telegram(value.botToken, value.chatId);
+  const registry = new GroupRegistry(groupStatePath(value), value.chatId);
+  let listener;
+  const queue = new DeliveryQueue(telegram, {
+    log: emit, destinations: () => registry.destinations(), isDestination: (id) => registry.has(id),
+    onFailure: (error, id) => listener.deliveryFailure(error, id),
+  });
+  listener = new GroupListener(telegram, registry, { queue, configuredChatId: value.chatId, log: emit, onFatal });
+  return { queue, listener };
+}
+
 async function withBrowser(action) {
   const value = await config();
   const browser = await connectBrowser(value.endpoint);
@@ -56,14 +71,19 @@ program.command('setup').description('Configure a Telegram private chat or group
     if (options.chat !== undefined) value.chatId = options.chat;
     if (options.selectChat && options.chat !== undefined) throw new Error('Use either --select-chat or --chat, not both.');
     if (!value.chatId || options.selectChat) {
-      let chats = await telegram.destinationChats();
-      if (!chats.length) {
-        await ask(`Send /start privately or /start@${me.username} in your group, then press Enter here: `);
-        chats = await telegram.destinationChats();
+      const release = await acquireBotLock(value.botToken, join(dirname(value.path), 'receiver-locks'));
+      try {
+        let chats = await telegram.destinationChats();
+        if (!chats.length) {
+          await ask(`Send /start privately or /start@${me.username} in your group, then press Enter here: `);
+          chats = await telegram.destinationChats();
+        }
+        if (!chats.length) throw new Error('No Telegram destinations found. Use setup --chat <id> if your chat is outside the pending updates.');
+        const selected = await choose(chats, 'Telegram destination');
+        value.chatId = selected.id;
+      } finally {
+        await release();
       }
-      if (!chats.length) throw new Error('No Telegram destinations found. Use setup --chat <id> if your chat is outside the pending updates.');
-      const selected = await choose(chats, 'Telegram destination');
-      value.chatId = selected.id;
     }
     requireTelegram(value);
     const chat = await telegram.call('getChat', { chat_id: value.chatId });
@@ -112,10 +132,27 @@ program.command('doctor').description('Check local configuration, Telegram authe
     if (!result.telegram.ok || !result.chrome.ok || !result.chrome.matchingTabs?.length) process.exitCode = 1;
   });
 
+program.command('listen-groups').description('Register added groups without Chrome or lecture monitoring; stop with Ctrl+C')
+  .action(async () => {
+    const value = await config(); requireTelegram(value);
+    let listener, queue;
+    const stop = () => { process.exitCode = 130; void listener?.close(); void queue?.close(); };
+    process.once('SIGINT', stop); process.once('SIGTERM', stop);
+    try {
+      ({ listener, queue } = groupDelivery(value, (error) => { emit('error', { message: error.message }); process.exitCode = 1; }));
+      await listener.start();
+      await listener.run();
+    } finally {
+      await listener?.close(); await queue?.close();
+      process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
+    }
+  });
+
 program.command('watch').description('Poll the selected session every 10 seconds; stop with Ctrl+C')
   .option('--read-only', 'Compatibility flag; Telegram answer submission is currently disabled')
   .option('--suggestions', 'Append optional Luna answer suggestions (uses Codex inference)', false)
   .option('--no-suggestions', 'Send basic alerts without invoking Codex')
+  .option('--no-auto-groups', 'Send only to the configured destination without listening for group additions')
   .option('--dry-run', 'Inspect questions and screenshot capture without invoking Telegram or Codex')
   .option('--once', 'Perform one check, finish delivery, suggestions and edits, then stop')
   .option('--session <code>', 'Select a Wooclap event code from tabs output')
@@ -127,10 +164,11 @@ program.command('watch').description('Poll the selected session every 10 seconds
     if (!Number.isFinite(interval) || interval < 1) throw new Error('--interval must be a number of seconds, at least 1.');
     if (!options.dryRun) requireTelegram(value);
     const abort = new AbortController();
-    let source, browser, queue, suggestions;
+    let source, browser, queue, suggestions, listener;
     const stop = () => {
       process.exitCode = 130;
       abort.abort();
+      void listener?.close();
       void suggestions?.close();
       void queue?.close();
       void (source ? source.close() : browser?.close());
@@ -152,13 +190,19 @@ program.command('watch').description('Poll the selected session every 10 seconds
       const selected = await choose(candidates, 'Wooclap session');
       source = new BrowserSource(browser, selected, value.endpoint);
       if (!options.dryRun) {
-        const telegram = new Telegram(value.botToken, value.chatId);
-        queue = new DeliveryQueue(telegram, { log: emit });
+        if (options.autoGroups) {
+          ({ listener, queue } = groupDelivery(value, (error) => {
+            emit('error', { message: `Automatic group registration stopped: ${error.message}` });
+            stop(); process.exitCode = 1;
+          }));
+          await listener.start();
+          if (!options.once) void listener.run();
+        } else queue = new DeliveryQueue(new Telegram(value.botToken, value.chatId), { log: emit });
         if (options.suggestions) suggestions = new CodexSuggestions({ log: emit });
       }
       if (abort.signal.aborted) return;
       const monitor = new Monitor(source, queue, { dryRun: options.dryRun, suggestions, log: emit });
-      emit('watching', { title: selected.title, session: selected.code, intervalSeconds: interval, dryRun: Boolean(options.dryRun), remoteAnswers: false, suggestions: Boolean(suggestions) });
+      emit('watching', { title: selected.title, session: selected.code, intervalSeconds: interval, dryRun: Boolean(options.dryRun), remoteAnswers: false, suggestions: Boolean(suggestions), automaticGroups: Boolean(listener) });
       await monitor.run({ intervalMs: interval * 1000, signal: abort.signal, once: options.once });
       if (options.once) {
         await queue?.idle();
@@ -166,6 +210,7 @@ program.command('watch').description('Poll the selected session every 10 seconds
         await queue?.idle();
       }
     } finally {
+      await listener?.close();
       await suggestions?.close();
       await queue?.close();
       if (source) await source.close(); else await browser?.close();

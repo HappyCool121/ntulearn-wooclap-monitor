@@ -26,12 +26,12 @@ export async function acquireBotLock(token, directory) {
         try { process.kill(pid, 0); }
         catch (checkError) { if (checkError.code === 'ESRCH') alive = false; }
       }
-      if (alive) throw new Error('Another answer receiver owns this bot. Stop it or use watch --read-only.');
+      if (alive) throw new Error('Another Telegram receiver owns this bot. Stop its watcher or group listener before starting another.');
       try { if (await readFile(path, 'utf8') === previous) await unlink(path); }
       catch (removeError) { if (removeError.code !== 'ENOENT') throw removeError; }
     }
   }
-  throw new Error('Cannot acquire the bot receiver lock. Use watch --read-only or retry.');
+  throw new Error('Cannot acquire the bot receiver lock. Stop the other watcher or group listener and retry.');
 }
 
 export class TelegramReceiver {
