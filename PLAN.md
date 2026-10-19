@@ -21,7 +21,7 @@ Telegram Bot API documentation confirms `my_chat_member` reports changes to the 
 
 ## Out of Scope
 
-Individual subscriptions, hosted deployment, unrelated refactoring, automatic answering, and changes to Luna generation.
+Hosted deployment, unrelated refactoring, automatic answering, and changes to Luna generation. Private subscriptions are authorized in the 2026-10-19 extension below.
 
 ## Reversibility
 
@@ -184,7 +184,7 @@ Real group delivery requires a running watcher and group membership. Tests used 
 
 ## Follow-up Work
 
-None required beyond live use. Individual subscriptions and hosting remain out of scope.
+The original group work is complete. Private subscriptions are implemented by the 2026-10-19 extension below; hosting remains out of scope.
 
 ## Decision Log
 
@@ -192,3 +192,120 @@ None required beyond live use. Individual subscriptions and hosting remain out o
 | --- | --- | --- | --- |
 | 2026-10-14 | Save bot-scoped groups in local JSON and preserve the configured private chat | The user wants automatic group delivery without database infrastructure | No new dependency or paid service |
 | 2026-10-14 | Generate one suggestion per question | Every destination receives the same captured question | No multiplication of inference usage |
+
+
+---
+
+## Step D: Private subscription extension (2026-10-19)
+
+### Status
+
+`done`
+
+### Objective
+
+Allow people to privately send /start to subscribe and /stop to unsubscribe while the watcher runs, with durable preferences across restarts.
+
+### Tasks
+
+- [x] Extend the existing atomic bot-scoped state with private subscriber preferences; accept existing group files.
+- [x] Process private start/stop commands, blocked bot updates, and forbidden delivery failures without affecting groups.
+- [x] Send confirmations through the delivery queue even after unsubscribing, and skip queued alerts/edits for removed subscribers.
+- [x] Update CLI help, README, and behavioral tests.
+
+### Relevant Files
+
+`src/groups.js`, `src/telegram.js`, `src/cli.js`, `test/groups.test.js`, `test/browser.integration.js`, `README.md`, `CLAUDE.md`
+
+### Expected Changes
+
+Add private preferences alongside groups; reuse fanout, polling lock, update offsets, and shared suggestions without dependencies.
+
+### Do Not Modify
+
+Live credentials, live state, the running watcher process, user Chrome tabs, answer submission, and Luna internals.
+
+### Commands
+
+```bash
+node --test test/groups.test.js test/telegram.test.js
+npm run check
+npm test
+npm run test:browser
+git diff --check
+```
+
+### Acceptance Criteria
+
+- [x] Start/stop works during an updated watcher run, persists, and de-duplicates the configured private chat.
+- [x] Explicit stop also suppresses the configured private destination; another start restores it.
+- [x] Blocking/forbidden delivery disables private alerts; unblocking alone does not resubscribe.
+- [x] Existing groups and suggestion broadcasts still work; tests use fake Telegram only.
+
+### Validation Results
+
+`node --test test/groups.test.js test/telegram.test.js`: 32/32 passed. `npm run check`: passed. `npm test`: 102/102 passed. `npm run test:browser`: 23/23 passed, including fake private subscriber plus group question delivery and shared suggestion edits. `git diff --check`: passed. Diff reviewed; no live Telegram calls or running watcher changes.
+
+### Findings / Notes
+
+Official Telegram API https://core.telegram.org/bots/api#getting-updates confirms message and my_chat_member updates use the existing poller, with a maximum 24-hour offline retention. Dedicated webfetch/Context7 tools are unavailable; official docs were read with web. Preserve existing groups JSON format by adding an optional privateChats map. Existing process PID 22204 runs watch --suggestions and has no hot reload: one restart is needed to activate new source. Keep it running during edits/testing. The prior plan is retained as subscription implementation history.
+
+## Step E: Final verification and cleanup
+
+### Status
+
+`done`
+
+### Objective
+
+Validate private subscription delivery and document activation clearly.
+
+### Tasks
+
+- [x] Run the commands in Step D, review the final diff, and remove stale behavioral documentation.
+- [x] Record results and explain the required restart and subscription commands.
+
+### Relevant Files
+
+All files listed in Step D and `PLAN.md`.
+
+### Expected Changes
+
+Completed validation records and user instructions.
+
+### Do Not Modify
+
+Live running process, credentials, Telegram chats, and browser sessions.
+
+### Commands
+
+```bash
+npm run check
+npm test
+npm run test:browser
+git diff --check
+```
+
+### Acceptance Criteria
+
+- [x] Validation passes and no unrelated changes or live calls occur.
+- [x] Activation instructions distinguish the running old process from updated source.
+
+### Validation Results
+
+`node --test test/groups.test.js test/telegram.test.js`: 32/32 passed. `npm run check`: passed. `npm test`: 102/102 passed. `npm run test:browser`: 23/23 passed, including fake private subscriber plus group question delivery and shared suggestion edits. `git diff --check`: passed. Diff reviewed; no live Telegram calls or running watcher changes.
+
+### Findings / Notes
+
+An in-flight delivery can finish before /stop is processed; subsequent queued deliveries must be skipped. No historical questions are replayed to a newly registered subscriber.
+
+## Follow-up Work (private subscriptions)
+
+Restart the user's watcher once to load the change; no automatic restart or live messaging during implementation.
+
+## Decision Log (private subscriptions)
+
+| Date | Decision | Rationale | Impact |
+| --- | --- | --- | --- |
+| 2026-10-19 | Reuse group listener and bot-scoped atomic state for private /start and /stop | Supports subscriptions during a run without a second competing poller | One restart activates the feature; future subscriptions need no restart |
+| 2026-10-19 | Explicit stop overrides configured private delivery in automatic mode | Unsubscribe must stop future alerts even for the configured recipient | --no-auto-groups remains the explicit single configured destination mode |

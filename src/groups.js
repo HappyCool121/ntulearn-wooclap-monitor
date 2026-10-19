@@ -5,6 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { acquireBotLock } from './telegram-receiver.js';
 
 const isGroup = (chat) => ['group', 'supergroup'].includes(chat?.type) && /^-[1-9]\d*$/.test(String(chat.id));
+const isPrivate = (chat) => chat?.type === 'private' && /^[1-9]\d*$/.test(String(chat.id));
 const isMember = (member) => ['member', 'administrator', 'creator'].includes(member?.status) || (member?.status === 'restricted' && member.is_member);
 
 export function groupStatePath(config) {
@@ -16,7 +17,7 @@ export function groupStatePath(config) {
 export class GroupRegistry {
   constructor(path, privateChatId = '') {
     this.path = path; this.privateChatId = /^[1-9]\d*$/.test(String(privateChatId)) ? String(privateChatId) : '';
-    this.state = { version: 1, offset: 0, groups: {} }; this.writes = Promise.resolve();
+    this.state = { version: 1, offset: 0, groups: {}, privateChats: {} }; this.writes = Promise.resolve();
   }
   async load() {
     let saved;
@@ -26,7 +27,12 @@ export class GroupRegistry {
       Object.entries(saved.groups).some(([id, group]) => !/^-[1-9]\d*$/.test(id) || !group || typeof group.active !== 'boolean' || typeof group.title !== 'string')) {
       throw new Error('Invalid Telegram group state. Check the local groups JSON file.');
     }
-    this.state = saved;
+    const privateChats = saved.privateChats === undefined ? {} : saved.privateChats;
+    if (!privateChats || Array.isArray(privateChats) || typeof privateChats !== 'object' ||
+      Object.entries(privateChats).some(([id, active]) => !/^[1-9]\d*$/.test(id) || typeof active !== 'boolean')) {
+      throw new Error('Invalid Telegram private subscriber state. Check the local groups JSON file.');
+    }
+    this.state = { ...saved, privateChats };
   }
   change(update) {
     const operation = this.writes.then(async () => {
@@ -48,6 +54,10 @@ export class GroupRegistry {
     if (!isGroup(chat)) return Promise.resolve();
     return this.change((state) => { state.groups[String(chat.id)] = { title: String(chat.title || ''), active: Boolean(active) }; });
   }
+  setPrivate(chat, active) {
+    if (!isPrivate(chat)) return Promise.resolve();
+    return this.change((state) => { state.privateChats[String(chat.id)] = Boolean(active); });
+  }
   migrate(from, to) {
     if (!/^-[1-9]\d*$/.test(String(from)) || !/^-[1-9]\d*$/.test(String(to))) return Promise.resolve();
     return this.change((state) => {
@@ -57,7 +67,11 @@ export class GroupRegistry {
     });
   }
   acknowledge(offset) { return this.change((state) => { state.offset = Math.max(state.offset, offset); }); }
-  destinations() { return [...new Set([this.privateChatId, ...Object.keys(this.state.groups).filter((id) => this.state.groups[id].active)].filter(Boolean))]; }
+  destinations() {
+    const privateIds = Object.keys(this.state.privateChats).filter((id) => this.state.privateChats[id]);
+    const configured = this.state.privateChats[this.privateChatId] !== false ? this.privateChatId : '';
+    return [...new Set([configured, ...privateIds, ...Object.keys(this.state.groups).filter((id) => this.state.groups[id].active)].filter(Boolean))];
+  }
   has(id) { return this.destinations().includes(String(id)); }
 }
 
@@ -107,6 +121,15 @@ export class GroupListener {
   }
   async handle(update) {
     const membership = update.my_chat_member;
+    if (membership && isPrivate(membership.chat)) {
+      if (membership.new_chat_member?.user?.id !== this.bot.id) return;
+      // Unblocking alone is not consent to resume alerts: require /start.
+      if (['kicked', 'left'].includes(membership.new_chat_member.status)) {
+        await this.registry.setPrivate(membership.chat, false);
+        this.log('private-unsubscribed', { chatId: String(membership.chat.id), reason: 'Bot blocked or removed.' });
+      }
+      return;
+    }
     if (membership && isGroup(membership.chat)) {
       if (membership.new_chat_member?.user?.id !== this.bot.id) return;
       const active = Boolean(isMember(membership.new_chat_member));
@@ -117,6 +140,18 @@ export class GroupListener {
       return;
     }
     const message = update.message;
+    if (isPrivate(message?.chat)) {
+      const command = /^\/(start|stop)(?:@([A-Za-z0-9_]+))?(?:\s|$)/i.exec(message.text || '');
+      if (!command || (command[2] && command[2].toLowerCase() !== this.bot.username.toLowerCase())) return;
+      const active = command[1].toLowerCase() === 'start';
+      await this.registry.setPrivate(message.chat, active);
+      this.log(active ? 'private-subscribed' : 'private-unsubscribed', { chatId: String(message.chat.id) });
+      const text = active
+        ? 'You are subscribed to Wooclap alerts. You will receive future questions from the session being monitored while the watcher is running. Send /stop to unsubscribe.'
+        : 'You are unsubscribed from Wooclap alerts. Send /start to subscribe again.';
+      this.queue?.enqueue([{ method: 'sendMessage', params: { chat_id: String(message.chat.id), text } }], `private-${active ? 'start' : 'stop'}-${message.chat.id}`, { requireDestination: false });
+      return;
+    }
     if (!isGroup(message?.chat)) return;
     if (message.migrate_to_chat_id) { await this.registry.migrate(message.chat.id, message.migrate_to_chat_id); return; }
     if (message.migrate_from_chat_id) { await this.registry.migrate(message.migrate_from_chat_id, message.chat.id); return; }
@@ -157,6 +192,13 @@ export class GroupListener {
     }
   }
   async deliveryFailure(error, id) {
+    if (/^[1-9]\d*$/.test(String(id))) {
+      if (error.code === 403) {
+        await this.registry.setPrivate({ id, type: 'private' }, false);
+        this.log('private-unsubscribed', { chatId: String(id), reason: 'Telegram denied delivery.' });
+      }
+      return;
+    }
     if (!String(id).startsWith('-')) return;
     if (error.migrateToChatId) {
       await this.registry.migrate(id, error.migrateToChatId);

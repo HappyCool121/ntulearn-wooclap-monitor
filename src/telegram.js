@@ -140,18 +140,18 @@ export class DeliveryQueue {
     this.items = []; this.running = null; this.stopped = false;
     this.abort = new AbortController();
   }
-  enqueue(parts, label, { onSent } = {}) {
+  enqueue(parts, label, { onSent, requireDestination = true } = {}) {
     if (this.stopped) return false;
     if (this.destinations && parts.every((part) => part.params.chat_id === undefined)) {
       let accepted = false;
       const bind = (part, id) => ({ ...part, params: { ...part.params, chat_id: id }, ...(part.fallback ? { fallback: bind(part.fallback, id) } : {}) });
       for (const id of new Set(this.destinations().map(String))) {
-        accepted = this.enqueue(parts.map((part) => bind(part, id)), `${label}@${id}`, { onSent }) || accepted;
+        accepted = this.enqueue(parts.map((part) => bind(part, id)), `${label}@${id}`, { onSent, requireDestination }) || accepted;
       }
       return accepted;
     }
     if (this.items.length >= this.maxPending) { this.log('delivery-failed', { label, reason: 'Delivery queue full; alert not queued.' }); return false; }
-    this.items.push({ parts, label, onSent });
+    this.items.push({ parts, label, onSent, requireDestination });
     this.kick(); return true;
   }
   kick() {
@@ -169,7 +169,7 @@ export class DeliveryQueue {
         let sent = false;
         for (let attempt = 1; attempt <= this.maxAttempts && !this.stopped; attempt++) {
           const chatId = String(part.params.chat_id ?? this.telegram.chatId);
-          if (this.isDestination && !this.isDestination(chatId)) {
+          if (item.requireDestination && this.isDestination && !this.isDestination(chatId)) {
             this.log('delivery-skipped', { label: item.label, chatId, reason: 'Destination is no longer registered.' });
             break;
           }

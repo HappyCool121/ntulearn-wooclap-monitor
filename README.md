@@ -9,13 +9,13 @@ Monitor a Wooclap session embedded in your logged-in NTULearn Chrome tab. Receiv
 - Recreates a readable card from the question's MathML if native capture fails or would cut off content.
 - Suppresses repeated alerts for an unchanged question and reports prolonged monitoring outages.
 - Optionally generates suggestions with the authenticated local Codex CLI using `gpt-6-luna`. Each delivered question finishes even if newer questions appear.
-- Automatically saves groups that add the bot and broadcasts alerts to them, alongside your configured private chat.
+- Automatically saves groups that add the bot and private chats that send `/start`, and broadcasts alerts to them alongside your configured chat.
 - Telegram answer submission is deferred: no answer buttons, answer reply handling, or browser submission starts during watching.
 - Detection uses deterministic DOM inspection. Suggestions use inference; no Telegram webhook or hosted server is required.
 
 ![Synthetic example of a recreated mathematical question](docs/example-question.jpg)
 
-This repository publishes the source code. Run the monitor on a computer with your own logged-in Chrome session and your own Telegram bot. GitHub does not run the lecture watcher for you. By default, **every group or supergroup that adds the bot receives future alerts**, alongside the configured private destination. All destinations receive the same lecture session being monitored on your computer. Individual `/subscribe` commands and channels are not supported. Use `watch --no-auto-groups` for the original single configured destination behavior.
+This repository publishes the source code. Run the monitor on a computer with your own logged-in Chrome session and your own Telegram bot. GitHub does not run the lecture watcher for you. By default, **every group or supergroup that adds the bot receives future alerts**, alongside the configured private destination. All destinations receive the same lecture session being monitored on your computer. Private users can send `/start` to subscribe and `/stop` to unsubscribe. Channels are not supported. Use `watch --no-auto-groups` for the original single configured destination behavior, without subscription handling.
 
 ## Requirements
 
@@ -52,7 +52,7 @@ Normal monitoring uses your installed Chrome, so it does not require downloading
 
 Settings are stored outside the repository at `~/.config/ntulearn-wooclap-monitor/config.json`, with `0600` file permissions on POSIX systems. Environment variables can override them. Setup reuses existing settings. Use `setup --select-chat` to choose another destination, or `setup --chat <id>` to set an explicit numeric ID. Group IDs are negative. Environment variables continue to override saved settings.
 
-Sending `/start` privately is a one-time setup step; it does not subscribe additional individual users. Groups register automatically while the watcher or group listener runs. Use a dedicated bot: setup and automatic registration preserve existing webhooks rather than removing another service's configuration. See [Telegram's official tutorial](https://core.telegram.org/bots/tutorial) for bot creation.
+Sending `/start` privately also subscribes that chat to future alerts while the watcher or listener runs. Groups register automatically too. Use a dedicated bot: setup and automatic registration preserve existing webhooks rather than removing another service's configuration. See [Telegram's official tutorial](https://core.telegram.org/bots/tutorial) for bot creation.
 
 ## Send alerts to a group
 
@@ -60,19 +60,29 @@ Sending `/start` privately is a one-time setup step; it does not subscribe addit
 2. Start the watcher with `npm start -- --suggestions` (or `npm start` for basic alerts).
 3. The group receives a connection message when registered, then future question and outage alerts. Add the bot to more groups to register those too. There is no need to run `setup --select-chat` for each group.
 
-Privacy mode can stay enabled. The bot needs permission to send messages and photos. Removing or kicking the bot unregisters the group. Groups and their update offsets are saved with owner-only permissions in a bot-specific `groups-<hash>.json` beside the local configuration file. They survive restarts; group membership is checked at startup. The configured private chat continues receiving alerts. A configured group is imported into this registry automatically on its first run. Supergroup migrations update registered IDs automatically.
+Privacy mode can stay enabled. The bot needs permission to send messages and photos. Removing or kicking the bot unregisters the group. Groups and their update offsets are saved with owner-only permissions in a bot-specific `groups-<hash>.json` beside the local configuration file. They survive restarts; group membership is checked at startup. The configured private chat continues receiving alerts unless it sends `/stop` in automatic mode. A configured group is imported into this registry automatically on its first run. Supergroup migrations update registered IDs automatically.
 
 The bot can be added while your computer is offline. Telegram retains pending membership updates for **at most 24 hours**. If the join happened earlier, send `/start@YourBotUsername` in the group while the listener is running (for this bot: `/start@wooclapper_bot`). That verifies current bot membership and registers the group. Registration adds only future questions; it does not replay previous alerts. See [Telegram's update delivery documentation](https://core.telegram.org/bots/api#getting-updates).
 
-To register groups without Chrome or an active lecture, run:
+To handle group registration and private subscriptions without Chrome or an active lecture, run:
 
 ```bash
 node src/cli.js listen-groups
 ```
 
-This keeps receiving group changes and sending connection messages until Ctrl+C. Stop it before starting the watcher: only one watcher/listener should poll a bot at a time. A receiver lock prevents overlapping local processes using the same configuration directory; a Telegram polling conflict stops the watcher/listener. Existing webhooks are never removed. Dry runs do not register groups, contact Telegram, or generate suggestions. `watch --once` processes pending group changes before its one check and drains all deliveries and edits.
+This keeps receiving group changes and private `/start` or `/stop` commands and sending confirmations until Ctrl+C. Stop it before starting the watcher: only one watcher/listener should poll a bot at a time. A receiver lock prevents overlapping local processes using the same configuration directory; a Telegram polling conflict stops the watcher/listener. Existing webhooks are never removed. Dry runs do not register groups, contact Telegram, or generate suggestions. `watch --once` processes pending group changes before its one check and drains all deliveries and edits.
 
 For a single explicit destination, continue using `setup --select-chat` or `setup --chat <id>`, then run `watch --no-auto-groups`. Stop any watcher/listener before interactive destination discovery. Setup validates access and rejects channels.
+
+## Subscribe in a private chat
+
+Anyone can open [@wooclapper_bot](https://t.me/wooclapper_bot) (or your own bot) and send `/start` while the watcher runs. The bot confirms the subscription; future questions and optional suggestions are sent privately. Send `/stop` to unsubscribe, or `/start` again to resume. Repeating `/start` does not create duplicate recipients. All subscribers receive the same session being monitored on the owner's computer; subscribers do not choose separate lectures.
+
+Private subscriptions persist across restarts in an optional `privateChats` map alongside groups in the same owner-only bot state file. Existing group files load without conversion or credential changes. `/stop` suppresses future queued alerts and suggestion edits, including for the configured private chat in automatic mode; an already in-flight send can still finish. The unsubscribe confirmation is still delivered. Blocking the bot or a forbidden delivery disables the private destination; unblocking alone does not resume alerts until another `/start`.
+
+The watcher or `listen-groups` must be running to process commands. Offline commands are available for at most 24 hours; resend `/start` if no confirmation arrives after starting the listener. Historical questions are not replayed on subscription. `--no-auto-groups` bypasses all subscription handling and uses only the configured destination, including any configured private chat previously stopped in automatic mode.
+
+After upgrading an already running watcher, restart it once to load the new code, then ask subscribers to send `/start`. After that restart, people can subscribe and unsubscribe during a lecture without restarting the watcher.
 
 ## Connect your Chrome tab
 
@@ -142,7 +152,7 @@ Every generation runs in a private temporary directory. Its JPEG is stored with 
 
 On success, failure, timeout, overflow, or shutdown, the worker closes its owned process and removes its temporary directory before scheduling any edit. If necessary it terminates only its own process group, escalating from SIGTERM to SIGKILL after two seconds, including descendants that ignore SIGTERM. Ctrl+C/SIGTERM cancels active generation, discards pending jobs, and waits for cleanup. It leaves your Chrome tabs open. `watch --once` drains initial delivery, generation, and resulting edits before exiting. Dry runs never invoke Codex or Telegram; `--no-suggestions` never invokes Codex.
 
-Telegram submission is currently disabled. The answer controller, receiver, and browser submission helpers remain in the source for future work, but ordinary watching starts none of the answer handling and exposes no submission controls. Its Telegram group listener handles membership changes and group registration only. Read the suggestion and enter any chosen response yourself in Wooclap.
+Telegram submission is currently disabled. The answer controller, receiver, and browser submission helpers remain in the source for future work, but ordinary watching starts none of the answer handling and exposes no submission controls. Its Telegram listener handles membership changes, group registration, and private subscription commands only. Read the suggestion and enter any chosen response yourself in Wooclap.
 
 ## Commands
 
@@ -151,9 +161,9 @@ Telegram submission is currently disabled. The answer controller, receiver, and 
 | `setup` | Hidden local token entry, private/group discovery, save settings, send test alert |
 | `doctor` | Check config, Telegram bot/chat access, Chrome, and matching tabs; send no messages |
 | `tabs` | List NTULearn tabs with embedded Wooclap sessions |
-| `listen-groups` | Save group joins/removals without Chrome; send connection messages |
-| `watch` | Register groups and broadcast question/outage alerts without inference |
-| `watch --no-auto-groups` | Send only to the configured chat; do not poll group updates |
+| `listen-groups` | Save groups and private subscriptions without Chrome; send confirmations |
+| `watch` | Register groups/private subscribers and broadcast question/outage alerts without inference |
+| `watch --no-auto-groups` | Send only to the configured chat; do not handle group/private subscriptions |
 | `watch --suggestions` | Append optional Luna suggestions with model attribution and disclaimer |
 | `watch --no-suggestions` | Send basic alerts without Codex inference |
 | `watch --read-only` | Compatibility flag; submission is disabled in every watch mode |
@@ -212,7 +222,7 @@ node src/cli.js --json tabs
 node src/cli.js --json watch --session ABCDEF --dry-run --once
 ```
 
-`doctor` returns `ready` and separate Telegram/Chrome checks. Its exit code is 1 when setup or a matching tab is missing. `tabs` returns a `tabs` array. `watch` emits selection, check, question, delivery, health, and `suggestion-queued`/`suggestion-started`/`suggestion-completed`/`suggestion-failed` events. Generation events include the alert ID, with duration and failure category on completion. Group registration emits `groups-listening`, `group-registered`, `group-removed`, retry/failure, and migration events. The initial `watching` event includes `remoteAnswers: false`, `suggestions`, and `automaticGroups`; question events include `screenshot`, `imageSource` (`native` or `recreated`), and capture diagnostics. Runtime failures emit an `error` event and exit nonzero. CLI argument/help/version output is handled by the parser; interactive setup does not support `--json`.
+`doctor` returns `ready` and separate Telegram/Chrome checks. Its exit code is 1 when setup or a matching tab is missing. `tabs` returns a `tabs` array. `watch` emits selection, check, question, delivery, health, and `suggestion-queued`/`suggestion-started`/`suggestion-completed`/`suggestion-failed` events. Generation events include the alert ID, with duration and failure category on completion. Private subscriptions emit `private-subscribed` and `private-unsubscribed`. Group registration emits `groups-listening`, `group-registered`, `group-removed`, retry/failure, and migration events. The initial `watching` event includes `remoteAnswers: false`, `suggestions`, and `automaticGroups`; question events include `screenshot`, `imageSource` (`native` or `recreated`), and capture diagnostics. Runtime failures emit an `error` event and exit nonzero. CLI argument/help/version output is handled by the parser; interactive setup does not support `--json`.
 
 ## Development and tests
 
@@ -229,7 +239,7 @@ Browser tests need installed Chrome. On a development/CI machine without Chrome,
 npx playwright install --with-deps chrome
 ```
 
-Unit tests cover state transitions, deduplication, configuration permissions, Telegram payloads/retries, suggestion limits, Unicode truncation, delayed edits, immutable question binding, image/text fallback, and a fake Codex executable. Worker tests exercise stdin/image input, ordering, duplicate receipts, missing CLI/auth, nonzero/empty/oversized output, queue saturation, timeouts, cancellation, and removal of temporary files and SIGTERM-ignoring process groups. Tests for the preserved submission/receiver helpers also remain. Browser tests use isolated temporary Chrome profiles and synthetic intercepted NTULearn/Wooclap pages. They cover frames, screenshots, MathML, successful submission, manual selections, changed/reordered questions, duplicate labels, custom radio controls, uncertain acknowledgment, and Ctrl+C. CLI tests use fake Codex and Telegram to verify default watching, edit retries, `--once` draining, `--dry-run`, `--read-only`, opt-in `--suggestions`, automatic group destinations, `--no-auto-groups`, and `--no-suggestions`, with no answer receiver or browser submission. Group tests cover saved membership and offsets, offline updates, joins/removals, migrations, startup verification, group start recovery, exclusive polling, webhook preservation, and shared suggestions across multiple chats with identical message IDs. They do not use a real NTULearn account or send Telegram messages. All quiz examples and the preview image are synthetic.
+Unit tests cover state transitions, deduplication, configuration permissions, Telegram payloads/retries, suggestion limits, Unicode truncation, delayed edits, immutable question binding, image/text fallback, and a fake Codex executable. Worker tests exercise stdin/image input, ordering, duplicate receipts, missing CLI/auth, nonzero/empty/oversized output, queue saturation, timeouts, cancellation, and removal of temporary files and SIGTERM-ignoring process groups. Tests for the preserved submission/receiver helpers also remain. Browser tests use isolated temporary Chrome profiles and synthetic intercepted NTULearn/Wooclap pages. They cover frames, screenshots, MathML, successful submission, manual selections, changed/reordered questions, duplicate labels, custom radio controls, uncertain acknowledgment, and Ctrl+C. CLI tests use fake Codex and Telegram to verify default watching, edit retries, `--once` draining, `--dry-run`, `--read-only`, opt-in `--suggestions`, automatic group destinations, `--no-auto-groups`, and `--no-suggestions`, with no answer receiver or browser submission. Group tests cover private subscription persistence, start/stop confirmations, blocked recipients, skipped queued alerts/edits, saved membership and offsets, offline updates, joins/removals, migrations, startup verification, group start recovery, exclusive polling, webhook preservation, and shared suggestions across multiple chats with identical message IDs. They do not use a real NTULearn account or send Telegram messages. All quiz examples and the preview image are synthetic.
 
 To regenerate the synthetic preview:
 

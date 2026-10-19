@@ -132,7 +132,7 @@ program.command('doctor').description('Check local configuration, Telegram authe
     if (!result.telegram.ok || !result.chrome.ok || !result.chrome.matchingTabs?.length) process.exitCode = 1;
   });
 
-program.command('listen-groups').description('Register added groups without Chrome or lecture monitoring; stop with Ctrl+C')
+program.command('listen-groups').description('Register groups and private /start or /stop subscriptions without Chrome; stop with Ctrl+C')
   .action(async () => {
     const value = await config(); requireTelegram(value);
     let listener, queue;
@@ -152,7 +152,7 @@ program.command('watch').description('Poll the selected session every 10 seconds
   .option('--read-only', 'Compatibility flag; Telegram answer submission is currently disabled')
   .option('--suggestions', 'Append optional Luna answer suggestions (uses Codex inference)', false)
   .option('--no-suggestions', 'Send basic alerts without invoking Codex')
-  .option('--no-auto-groups', 'Send only to the configured destination without listening for group additions')
+  .option('--no-auto-groups', 'Send only to the configured destination without group or private subscription handling')
   .option('--dry-run', 'Inspect questions and screenshot capture without invoking Telegram or Codex')
   .option('--once', 'Perform one check, finish delivery, suggestions and edits, then stop')
   .option('--session <code>', 'Select a Wooclap event code from tabs output')
@@ -192,7 +192,7 @@ program.command('watch').description('Poll the selected session every 10 seconds
       if (!options.dryRun) {
         if (options.autoGroups) {
           ({ listener, queue } = groupDelivery(value, (error) => {
-            emit('error', { message: `Automatic group registration stopped: ${error.message}` });
+            emit('error', { message: `Automatic destination registration stopped: ${error.message}` });
             stop(); process.exitCode = 1;
           }));
           await listener.start();

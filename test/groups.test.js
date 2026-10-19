@@ -59,12 +59,12 @@ test('offline joins/removals are saved before polling acknowledges them; startup
   const fresh = new GroupRegistry(registry.path, '42'); await fresh.load(); assert.deepEqual(fresh.destinations(), ['42', '-20']);
 });
 
-test('group start recovers expired joins, ignores other commands/private chats/channels, and removal/re-add works', async (t) => {
+test('group start recovers expired joins, ignores other commands/channels, and removal/re-add works', async (t) => {
   const { registry } = await fixture(t); const sent = [], verified = [];
   const listener = new GroupListener({ call: async (method, params) => { assert.equal(method, 'getChatMember'); verified.push(params); return { status: 'member' }; } }, registry, { queue: { enqueue: (parts) => sent.push(parts) } });
   listener.bot = bot;
   for (const text of ['/start@other_bot', '/subscribe', 'hello']) await listener.handle({ message: { chat: group(), text } });
-  await listener.handle({ message: { chat: { id: 9, type: 'private' }, text: '/start' } });
+  await listener.handle({ message: { chat: { id: 9, type: 'private' }, text: 'hello' } });
   await listener.handle({ my_chat_member: { chat: { id: -5, type: 'channel' }, new_chat_member: { user: bot, status: 'member' } } });
   await listener.handle({ message: { date: 0, chat: group(), text: '/start@TEST_BOT' } });
   await listener.handle({ message: { chat: group(), text: '/start' } });
@@ -198,4 +198,74 @@ globalThis.fetch = async (url, init) => {
   const code = await new Promise((resolve) => child.once('close', resolve)); clearTimeout(timer);
   assert.equal(code, 130, output); assert.match(output, /groups-listening/); assert.ok(!output.includes('12345:TEST_ONLY'));
   const saved = JSON.parse(await readFile(groupStatePath(config), 'utf8')); assert.equal(saved.groups['-10'].active, true); assert.equal(saved.offset, 2);
+});
+
+test('private preferences load legacy state, persist start/stop, and de-duplicate the configured chat', async (t) => {
+  const { registry } = await fixture(t);
+  await writeFile(registry.path, JSON.stringify({ version: 1, offset: 5, groups: { '-10': { title: 'Existing', active: true } } }));
+  await registry.load();
+  await Promise.all([registry.setPrivate({ id: 9, type: 'private' }, true), registry.setPrivate({ id: 42, type: 'private' }, true)]);
+  assert.deepEqual(registry.destinations(), ['42', '9', '-10']);
+  await registry.setPrivate({ id: 42, type: 'private' }, false);
+  const fresh = new GroupRegistry(registry.path, '42'); await fresh.load();
+  assert.deepEqual(fresh.destinations(), ['9', '-10']); assert.equal(fresh.state.offset, 5);
+  assert.equal((await stat(registry.path)).mode & 0o777, 0o600);
+  for (const privateChats of [null, [], { '-9': true }, { '9': 'yes' }]) {
+    await writeFile(registry.path, JSON.stringify({ version: 1, offset: 5, groups: {}, privateChats }));
+    await assert.rejects(fresh.load(), /Invalid Telegram private/);
+  }
+});
+
+test('private start/stop works during polling and confirms stop while dropping queued alerts and edits', async (t) => {
+  const { registry } = await fixture(t); const sent = [];
+  const telegram = { chatId: '42', call: async (method, params) => { sent.push({ method, ...params }); return { message_id: 1 }; } };
+  const queue = new DeliveryQueue(telegram, { destinations: () => registry.destinations(), isDestination: (id) => registry.has(id) });
+  t.after(() => queue.close());
+  const listener = new GroupListener(telegram, registry, { queue }); listener.bot = bot;
+  const command = (id, text) => ({ message: { chat: { id, type: 'private' }, text } });
+  for (const text of ['/start@other_bot', '/starter', 'hello', '/subscribe', '/stopped']) await listener.handle(command(9, text));
+  assert.equal(registry.has(9), false); assert.equal(sent.length, 0);
+  await listener.handle(command(9, '/start@TEST_BOT payload')); await queue.idle();
+  assert.equal(registry.has(9), true); assert.match(sent[0].text, /subscribed/);
+  await listener.handle(command(9, '/start')); await queue.idle();
+  queue.enqueue([{ method: 'sendMessage', params: { text: 'question' } }], 'q'); await queue.idle();
+  assert.deepEqual(sent.filter((part) => part.text === 'question').map((part) => part.chat_id), ['42', '9']);
+  // Hold the worker so both already queued alerts and edits outlive /stop.
+  const kick = queue.kick; queue.kick = () => {};
+  queue.enqueue([{ method: 'sendPhoto', params: { chat_id: '9', caption: 'late question' } }], 'late-q');
+  queue.enqueue([{ method: 'editMessageCaption', params: { chat_id: '9', message_id: 1, caption: 'late answer' } }], 'late-edit');
+  await listener.handle(command(9, '/stop')); assert.equal(registry.has(9), false);
+  queue.kick = kick; queue.kick(); await queue.idle();
+  assert.equal(sent.filter((part) => part.method === 'sendPhoto' || part.method === 'editMessageCaption').length, 0);
+  assert.match(sent.at(-1).text, /unsubscribed/); assert.equal(sent.at(-1).chat_id, '9');
+  await listener.handle(command(42, '/stop')); await queue.idle(); assert.equal(registry.has(42), false);
+  await listener.handle(command(42, '/start')); await queue.idle(); assert.equal(registry.has(42), true);
+  const fresh = new GroupRegistry(registry.path, '42'); await fresh.load(); assert.equal(fresh.has(9), false);
+});
+
+test('blocked private chats and forbidden deliveries unsubscribe without restoring on unblock', async (t) => {
+  const { registry } = await fixture(t); await registry.setPrivate({ id: 9, type: 'private' }, true);
+  await registry.set(group(), true);
+  const listener = new GroupListener({}, registry); listener.bot = bot;
+  const update = (status, user = bot) => ({ my_chat_member: { chat: { id: 9, type: 'private' }, new_chat_member: { user, status } } });
+  await listener.handle(update('kicked', { id: 99 })); assert.equal(registry.has(9), true);
+  await listener.handle(update('kicked')); assert.equal(registry.has(9), false);
+  await listener.handle(update('member')); assert.equal(registry.has(9), false);
+  await listener.handle({ message: { chat: { id: 9, type: 'private' }, text: '/start' } });
+  await listener.deliveryFailure(new TelegramError('forbidden', { code: 403 }), '9'); assert.equal(registry.has(9), false);
+  await listener.deliveryFailure(new TelegramError('temporary', { code: 429 }), '42'); assert.equal(registry.has(42), true);
+  await listener.deliveryFailure(new TelegramError('forbidden', { code: 403 }), '42'); assert.equal(registry.has(42), false);
+  assert.equal(registry.has(-10), true);
+});
+
+test('private changes are saved before update acknowledgment; failed saves do not advance offset', async (t) => {
+  const { dir, registry } = await fixture(t); let text = '/start';
+  const listener = new GroupListener({ call: async () => [{ update_id: 4, message: { chat: { id: 9, type: 'private' }, text } }] }, registry);
+  listener.bot = bot;
+  await listener.poll(0);
+  const fresh = new GroupRegistry(registry.path, '42'); await fresh.load();
+  assert.equal(fresh.has(9), true); assert.equal(fresh.state.offset, 5);
+  registry.path = join(dir, 'blocked', 'state.json'); await writeFile(join(dir, 'blocked'), 'x');
+  registry.state.offset = 4; text = '/stop';
+  await assert.rejects(listener.poll(0)); assert.equal(registry.state.offset, 4); assert.equal(registry.has(9), true);
 });

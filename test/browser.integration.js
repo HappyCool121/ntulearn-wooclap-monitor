@@ -292,6 +292,7 @@ globalThis.fetch = async (url, init) => {
    if (!polled) {
      polled = true;
      const updates = process.env.TEST_GROUPS ? [-1009871, -1009872].map((id, i) => ({ update_id: i + 1, my_chat_member: { chat: { id, type: 'supergroup', title: 'Test group' }, new_chat_member: { user: { id: 12345 }, status: 'member' } } })) : [];
+     if (process.env.TEST_PRIVATE) updates.push({ update_id: 3, message: { chat: { id: 99, type: 'private' }, text: '/start' } });
      return { ok: true, status: 200, json: async () => ({ ok: true, result: updates }) };
    }
    return new Promise((resolve, reject) => {
@@ -308,7 +309,7 @@ globalThis.fetch = async (url, init) => {
       const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
       for (const scenario of [
         { flags: ['--once', '--suggestions'], suggestions: true },
-        { flags: ['--once', '--suggestions'], suggestions: true, groups: true },
+        { flags: ['--once', '--suggestions'], suggestions: true, groups: true, private: true },
         { flags: ['--suggestions'], suggestions: true, continuous: true },
         { flags: ['--once', '--read-only', '--suggestions'], suggestions: true, fallback: true, chatId: '-1001234567890' },
         { flags: ['--once'], suggestions: false },
@@ -321,7 +322,7 @@ globalThis.fetch = async (url, init) => {
         await rm(groupStatePath({ path: join(profile, 'unused-config.json'), botToken: '12345:TEST_ONLY' }), { force: true });
         const child = spawn(process.execPath, ['--import', preload, cli, '--endpoint', endpoint, '--json', 'watch', ...scenario.flags, '--interval', '1'], {
           stdio: ['ignore', 'pipe', 'pipe'], cwd: tmpdir(),
-          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TELEGRAM_BOT_TOKEN: '12345:TEST_ONLY', TELEGRAM_CHAT_ID: scenario.chatId || '42', NTULEARN_MONITOR_CONFIG: join(profile, 'unused-config.json'), TEST_PHOTO_FALLBACK: scenario.fallback ? '1' : '', TEST_GROUPS: scenario.groups ? '1' : '' },
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TELEGRAM_BOT_TOKEN: '12345:TEST_ONLY', TELEGRAM_CHAT_ID: scenario.chatId || '42', NTULEARN_MONITOR_CONFIG: join(profile, 'unused-config.json'), TEST_PHOTO_FALLBACK: scenario.fallback ? '1' : '', TEST_GROUPS: scenario.groups ? '1' : '', TEST_PRIVATE: scenario.private ? '1' : '' },
         });
         let output = '', error = '', signalled = false;
         child.stdout.on('data', (data) => {
@@ -344,9 +345,13 @@ globalThis.fetch = async (url, init) => {
           await assert.rejects(readFile(callsFile), { code: 'ENOENT' });
         } else {
           const allCalls = (await readFile(callsFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
-          const calls = allCalls.filter((call) => ['sendPhoto', 'sendMessage', 'editMessageCaption', 'editMessageText'].includes(call.method) && !call.params.text?.startsWith('Wooclap alerts are connected'));
+          const calls = allCalls.filter((call) => ['sendPhoto', 'sendMessage', 'editMessageCaption', 'editMessageText'].includes(call.method) && !call.params.text?.startsWith('Wooclap alerts are connected') && !call.params.text?.startsWith('You are subscribed'));
           assert.ok(calls.every((call) => call.params.reply_markup === undefined));
-          const ids = scenario.groups ? ['42', '-1009871', '-1009872'] : [scenario.chatId || '42'];
+          const ids = [...(scenario.groups ? ['42', '-1009871', '-1009872'] : [scenario.chatId || '42'])];
+          if (scenario.private) {
+            ids.splice(1, 0, '99');
+            assert.ok(allCalls.some((call) => call.params.chat_id === '99' && call.params.text?.startsWith('You are subscribed')));
+          }
           assert.ok(calls.every((call) => ids.includes(call.params.chat_id)));
           assert.ok(calls.every((call) => (call.params.caption || call.params.text).includes('Source: https://github.com/HappyCool121/ntulearn-wooclap-monitor')));
           assert.equal(calls.filter((call) => call.method === 'sendPhoto').length, ids.length);
