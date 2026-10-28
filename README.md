@@ -204,17 +204,20 @@ ntulearn-watch --help
 - Native screenshots use direct Chrome capture to avoid element stability waits. They cover the question panel or Wooclap main area and may include any response visible there. Images are held in memory for alerts and temporarily written to the private generation directory when suggestions run.
 - If native capture fails, is obscured, or would cut off content, a controlled headless renderer creates a question card from an immutable semantic snapshot. KaTeX's MathML is retained once, including fractions, powers, and inequalities. Recreated images are labeled in the caption.
 - The renderer supports text/MathML questions. Image/video/unsupported graphical questions require a successful native screenshot; unsupported graphics are not silently omitted from recreated cards. The renderer blocks scripts and external resource requests.
-- Native capture has a 2-second deadline, fallback rendering 5 seconds, and the combined image operation 8 seconds. Images are checked against Telegram photo limits.
+- Native capture has a 2-second deadline. The fallback allows 15 seconds for cold Chrome startup within a 20-second total rendering deadline; the combined image operation is capped at 23 seconds. Slow startup can delay the alert until capture finishes or text fallback is used. The renderer reuses its browser after launch. Images are checked against Telegram photo limits.
 - Each successful alert contains one image and a short lecture/time/link caption. Suggestions add a placeholder followed by the generated answer in the same message. If both image paths fail, or Telegram rejects the photo, a concise notice links to Wooclap. Detailed errors and alert IDs stay in Terminal.
 - Delivery is queued independently of polling. Transient errors retry up to five times per part with backoff; Telegram rate limits are honored. Confirmed parts are not resent. A lost acknowledgment can still cause a duplicate, so exactly-once delivery is not guaranteed.
 - The in-memory queue holds at most 100 destination deliveries/edits. Group broadcasts share one serial worker; one destination failing does not discard other destinations, but retries and Telegram rate limits can delay later recipients. Overflow is logged and excess deliveries are not queued. Stopping discards pending deliveries and deduplication history. Restarting on an active question sends a fresh alert.
-- After 60 seconds of unreadable/loading checks, the tool queues one outage notice and later one recovery notice. Network loss may also prevent those notices from arriving.
+- Correct/wrong feedback banners (including "Congratulations!") are healthy results screens. Results screens generate no check logs, captures, new suggestions, question alerts, or outage notices. Matching excludes question and option content, and ignores hidden feedback. Previously queued suggestions and deliveries may still finish.
+- After 60 seconds of unreadable/loading checks, the tool queues one outage notice and later one recovery notice. A results screen clears a pending outage; if an already reported outage recovers into results, its recovery notice waits until the next active question or waiting screen. Network loss may also prevent those notices from arriving.
 - Questions or waiting/reopen transitions entirely between checks can be missed. Sleep, offline Chrome, expired login, and DOM changes can interrupt detection. There is no historical question recovery.
 - The event link contains no login query parameters. Opening it on another device may require joining or signing in there.
 
 ## JSON output
 
 `--json` emits one JSON object per line with an `event` field. It never returns credentials.
+
+Results screens suppress `check` events in both normal and JSON output while polling continues.
 
 ```bash
 node src/cli.js --json doctor

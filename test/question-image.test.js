@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { cardHtml, renderNode, withDeadline, QuestionImageRenderer } from '../src/question-image.js';
 import { BrowserSource, boxInside } from '../src/browser.js';
 
@@ -59,6 +60,53 @@ test('renderer timeout closes an active isolated context', async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(closes >= 1); assert.equal(renderer.contexts.size, 0);
   await renderer.close();
+});
+test('slow cold launch renders successfully and the browser is reused', { timeout: 10_000 }, async () => {
+  let launches = 0, contexts = 0, closed = 0;
+  const jpeg = Buffer.from('ffd8ffc00011080020002003012200021101031101', 'hex');
+  const browser = { isConnected: () => true, close: async () => { closed++; }, newContext: async () => {
+    contexts++;
+    return { route: async () => {}, close: async () => {}, newPage: async () => ({
+      setContent: async () => {}, locator: () => ({ boundingBox: async () => ({ height: 200 }) }), screenshot: async () => jpeg,
+    }) };
+  } };
+  const renderer = new QuestionImageRenderer({ launch: async ({ timeout }) => {
+    launches++;
+    if (timeout <= 5500) throw new Error('launch timeout');
+    await sleep(5500);
+    return browser;
+  } });
+  try {
+    assert.deepEqual(await renderer.render(snapshot), jpeg);
+    assert.deepEqual(await renderer.render(snapshot), jpeg);
+    assert.equal(launches, 1); assert.equal(contexts, 2);
+  } finally { await renderer.close(); }
+  assert.equal(closed, 1);
+});
+test('a rejected browser launch clears pending state and can retry', async () => {
+  let launches = 0;
+  const browser = { isConnected: () => true, close: async () => {} };
+  const renderer = new QuestionImageRenderer({ launch: async () => {
+    if (++launches === 1) throw new Error('cold launch failed');
+    return browser;
+  } });
+  await assert.rejects(renderer.getBrowser(), /cold launch failed/);
+  assert.equal(renderer.launching, null);
+  assert.equal(await renderer.getBrowser(), browser);
+  await renderer.close();
+});
+test('abort during browser launch prevents late context creation and closes owned browser on shutdown', async () => {
+  let resolveLaunch, closes = 0;
+  const renderer = new QuestionImageRenderer({ launch: () => new Promise((resolve) => { resolveLaunch = resolve; }) });
+  const abort = new AbortController();
+  const rendering = renderer.render(snapshot, { signal: abort.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  abort.abort();
+  await assert.rejects(rendering, /cancelled/);
+  const closing = renderer.close();
+  resolveLaunch({ isConnected: () => true, close: async () => { closes++; }, newContext: () => assert.fail('context created after shutdown') });
+  await closing;
+  assert.ok(closes >= 1);
 });
 test('native timeout falls back and does not disable later captures', { timeout: 4000 }, async () => {
   const renderer = { render: async () => Buffer.from('card'), close: async () => {}, cancelActive: async () => {} };

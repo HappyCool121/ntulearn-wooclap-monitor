@@ -1,5 +1,8 @@
 import { chromium } from 'playwright';
 
+// Rendering includes cold browser startup; the outer budget also covers native capture.
+export const IMAGE_CAPTURE_TIMEOUTS = Object.freeze({ native: 2000, launch: 15_000, render: 20_000, total: 23_000 });
+
 export const escapeHtml = (value = '') => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 const mathTags = new Set('math mrow mi mn mo mtext mspace mfrac msqrt mroot msup msub msubsup mover munder munderover mfenced mtable mtr mtd mstyle mpadded mphantom menclose mmultiscripts mprescripts none'.split(' '));
 const htmlTags = new Set('span strong b em i p br code sup sub ul ol li'.split(' '));
@@ -75,13 +78,13 @@ export class QuestionImageRenderer {
   async getBrowser() {
     if (this.closed) throw new Error('Question image renderer is closed.');
     if (!this.browser?.isConnected()) {
-      this.launching ||= this.launch({ channel: 'chrome', headless: true, timeout: 4000 }).finally(() => { this.launching = null; });
+      this.launching ||= this.launch({ channel: 'chrome', headless: true, timeout: IMAGE_CAPTURE_TIMEOUTS.launch }).finally(() => { this.launching = null; });
       this.browser = await this.launching;
       if (this.closed) { await this.browser.close(); throw new Error('Question image renderer is closed.'); }
     }
     return this.browser;
   }
-  async render(snapshot, { signal, timeoutMs = 5000 } = {}) {
+  async render(snapshot, { signal, timeoutMs = IMAGE_CAPTURE_TIMEOUTS.render } = {}) {
     const html = cardHtml(snapshot);
     let context;
     let cancelled = false;

@@ -23,13 +23,18 @@ export class Monitor {
     this.tracker = new AppearanceTracker(); this.health = new HealthTracker(); this.runId = randomUUID().slice(0, 8);
     this.answers = answers;
     this.suggestions = suggestions;
+    this.pendingRecovery = false;
   }
   async tick() {
     let observation;
     try { observation = await this.source.read(); }
     catch (error) { observation = { state: 'unavailable', reason: error.message }; }
-    this.log('check', { state: observation.state, reason: observation.reason, session: observation.session });
-    const change = this.health.observe(['active', 'waiting', 'results'].includes(observation.state), this.now());
+    const results = observation.state === 'results';
+    if (!results) this.log('check', { state: observation.state, reason: observation.reason, session: observation.session });
+    let change = this.health.observe(['active', 'waiting', 'results'].includes(observation.state), this.now());
+    if (results && change === 'recovered') { this.pendingRecovery = true; change = null; }
+    if (this.pendingRecovery && ['active', 'waiting'].includes(observation.state)) { change = 'recovered'; this.pendingRecovery = false; }
+    if (change === 'lost') this.pendingRecovery = false;
     if (change) {
       const text = change === 'lost' ? 'Wooclap monitoring has been unavailable for at least 60 seconds. Check Chrome and your NTULearn login.' : 'Wooclap monitoring has recovered.';
       this.log(`monitoring-${change}`, {});

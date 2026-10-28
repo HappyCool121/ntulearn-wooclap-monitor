@@ -70,6 +70,53 @@ test('real Chrome iframe extraction, screenshots, standalone CLI, and disconnect
         ['<main><h1>Wooclap</h1><button>Open reactions</button><button>Send a message</button></main>', 'unavailable'],
       ]) { await set(html); assert.equal(classifyObservation(await frame.evaluate(extractDom)).state, expected); }
     });
+    await t.test('standalone correct and incorrect banners recognize results with retained question content', async () => {
+      for (const label of ['Congratulations!', 'Correct!', 'Incorrect!', 'Wrong answer!', 'Your answer is correct.', 'YOUR ANSWER IS INCORRECT!']) {
+        for (const banner of [`<div><span>${label}</span></div>`, `<h2 role="status">${label}</h2>`]) {
+          await set(multiple.replace('<fieldset>', `${banner}<fieldset>`).replaceAll('type="radio"', 'type="radio" disabled').replace('<button>Submit', '<button disabled>Submit'));
+          assert.equal((await source.read()).state, 'results', label);
+        }
+      }
+      await set('<main><h1>Which number is prime?</h1><div>Congratulations!</div><div>4</div><div>5 ✓</div><div>6</div></main>');
+      assert.equal((await source.read()).state, 'results');
+      await set(multiple.replace('<fieldset>', '<div>Congratulations!</div><fieldset>'));
+      assert.equal((await source.read()).state, 'results', 'feedback takes precedence over retained enabled controls');
+    });
+    await t.test('feedback words in prompts, options, or hidden banners do not suppress active questions', async () => {
+      for (const label of ['Congratulations!', 'Correct!', 'Incorrect!', 'Wrong answer!', 'Your answer is correct.']) {
+        for (const html of [
+          multiple.replace('Which number is prime?', `<span>${label}</span>`),
+          multiple.replace('>4</label>', `><span>${label}</span></label>`),
+          choiceButtons.replace('>∈</button>', `><span>${label}</span></button>`),
+          multiple.replace('<fieldset>', `<div hidden>${label}</div><fieldset>`),
+          multiple.replace('<fieldset>', `<div aria-hidden="true"><span>${label}</span></div><fieldset>`),
+          multiple.replace('<fieldset>', `<div style="display:none"><span>${label}</span></div><fieldset>`),
+        ]) {
+          await set(html); assert.equal((await source.read()).state, 'active', html);
+        }
+      }
+      await set(multiple.replace('<fieldset>', '<p>Congratulations! Explain why this answer is wrong.</p><fieldset>'));
+      assert.equal((await source.read()).state, 'active', 'partial label is not feedback');
+      await set(multiple.replace('<fieldset>', '<div>Congratulations!</div><div role="alert">Connection lost</div><fieldset>'));
+      assert.equal((await source.read()).state, 'unavailable');
+      await set(multiple.replace('<fieldset>', '<div>Incorrect!</div><div role="alert">Session expired</div><fieldset>'));
+      assert.equal((await source.read()).state, 'unavailable');
+    });
+    await t.test('results CLI output has no check or question logs in normal or JSON mode', async () => {
+      await set('<main><h1>Which number is prime?</h1><div>Congratulations!</div><div>4</div><div>5 ✓</div><div>6</div></main>');
+      for (const flags of [[], ['--json']]) {
+        const child = spawn(process.execPath, ['src/cli.js', '--endpoint', endpoint, ...flags, 'watch', '--once', '--dry-run'], { cwd: fileURLToPath(new URL('..', import.meta.url)) });
+        let output = '', errors = '';
+        child.stdout.on('data', (chunk) => { output += chunk; }); child.stderr.on('data', (chunk) => { errors += chunk; });
+        const timeout = setTimeout(() => child.kill('SIGKILL'), 15_000);
+        let code;
+        try { code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); }); }
+        finally { clearTimeout(timeout); }
+        assert.equal(code, 0, output + errors);
+        assert.match(output, /watching/);
+        assert.doesNotMatch(output, /"event":"(?:check|question|would-alert|monitoring-)|\] (?:check|question|would-alert|monitoring-)/);
+      }
+    });
     await t.test('question change recreates the saved question instead of capturing the new one', async () => {
       await set(multiple); const previous = await source.read(); await set(open);
       const result = await source.captureImage(previous);
@@ -86,10 +133,12 @@ test('real Chrome iframe extraction, screenshots, standalone CLI, and disconnect
     });
     await t.test('offscreen choice triggers a complete recreated image', async () => {
       await set(multiple + '<style>fieldset label:last-child{margin-top:700px}</style>');
+      const before = await frame.evaluate(() => ({ x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }));
       const result = await source.captureImage(await source.read());
       assert.equal(result.imageSource, 'recreated');
       assert.match(result.nativeError, /offscreen|beyond|viewport/);
       assert.ok(jpegDimensions(result.photo).height > 100);
+      assert.deepEqual(await frame.evaluate(() => ({ x: scrollX, y: scrollY, width: innerWidth, height: innerHeight })), before);
     });
     await t.test('overlay outside the iframe causes recreation instead of capturing the overlay', async () => {
       await set(multiple);
@@ -104,18 +153,18 @@ test('real Chrome iframe extraction, screenshots, standalone CLI, and disconnect
       } finally { await page.locator('#test-overlay').evaluate((element) => element.remove()); }
     });
     await t.test('synthetic KaTeX question recreates each expression once and all four choices', async () => {
-      await set(mathQuestionHTML);
+      await set(mathQuestionHTML + '<style>[role="radio"]:last-child{margin-top:700px}</style>');
+      const before = await frame.evaluate(() => ({ x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }));
       const observation = await source.read();
       assert.equal(observation.visualSnapshot.unsupported, '');
       assert.equal(observation.visualSnapshot.choices.length, 4);
       const html = cardHtml(observation.visualSnapshot);
       assert.equal((html.match(/<math\b/g) || []).length, 10);
       assert.doesNotMatch(html, /annotation|DUPLICATE_VISUAL_MATH|katex-html/);
-      const native = source.captureNative;
-      source.captureNative = async () => { throw new Error('Forced compositor failure'); };
-      let result;
-      try { result = await source.captureImage(observation); } finally { source.captureNative = native; }
+      const result = await source.captureImage(observation);
       assert.equal(result.imageSource, 'recreated'); assert.equal(jpegDimensions(result.photo).width, 1000);
+      assert.match(result.nativeError, /offscreen|beyond|viewport/);
+      assert.deepEqual(await frame.evaluate(() => ({ x: scrollX, y: scrollY, width: innerWidth, height: innerHeight })), before);
       if (process.env.NTULEARN_TEST_PREVIEW) await writeFile(process.env.NTULEARN_TEST_PREVIEW, result.photo);
     });
     await t.test('fraction/power MathML survives and external resource markup cannot execute', async () => {

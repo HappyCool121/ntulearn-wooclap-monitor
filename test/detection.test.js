@@ -88,3 +88,63 @@ test('poll interval accounts for check time and abort stops the loop', async () 
   await monitor.run({ intervalMs: 10_000, signal: abort.signal, wait: async (delay) => { waits.push(delay); abort.abort(); } });
   assert.equal(ticks, 1); assert.deepEqual(waits, [9700]);
 });
+
+test('results remain completely silent for minutes and clear a pending outage', async () => {
+  let now = 0, state = 'unavailable';
+  const events = [], deliveries = [];
+  const monitor = new Monitor({
+    read: async () => ({ state, session: 'ABCDEF' }),
+    screenshot: () => assert.fail('results captured'),
+  }, { enqueue: (...args) => deliveries.push(args) }, {
+    now: () => now, log: (...args) => events.push(args),
+    suggestions: { enqueue: () => assert.fail('results generated a suggestion') },
+  });
+  await monitor.tick(); now = 50_000; state = 'results'; events.length = 0;
+  for (; now < 300_000; now += 10_000) await monitor.tick();
+  assert.deepEqual(events, []); assert.deepEqual(deliveries, []);
+  state = 'unavailable'; await monitor.tick();
+  assert.equal(deliveries.length, 0);
+  now += 60_000; await monitor.tick();
+  assert.equal(deliveries.length, 1); assert.equal(deliveries[0][1], 'health-lost');
+});
+
+test('a genuine outage recovers silently through results and reports once on waiting or active', async () => {
+  for (const healthyState of ['waiting', 'active']) {
+    let now = 0, current = { state: 'unavailable' };
+    const events = [], labels = [];
+    const monitor = new Monitor({ read: async () => current, screenshot: async () => Buffer.from('photo') },
+      { enqueue: (_parts, label) => labels.push(label) }, { now: () => now, log: (event) => events.push(event) });
+    await monitor.tick(); now = 60_000; await monitor.tick();
+    current = { state: 'results' }; events.length = 0;
+    for (let i = 0; i < 20; i++) { now += 10_000; await monitor.tick(); }
+    assert.deepEqual(events, []); assert.deepEqual(labels, ['health-lost']);
+    current = healthyState === 'active' ? observe() : { state: healthyState };
+    await monitor.tick(); await monitor.tick();
+    assert.equal(events.filter((event) => event === 'monitoring-recovered').length, 1);
+    assert.equal(labels.filter((label) => label === 'health-recovered').length, 1);
+  }
+});
+
+test('question to results to waiting creates no health notices and rearms once', async () => {
+  let current = observe();
+  const events = [], labels = [];
+  const monitor = new Monitor({ read: async () => current, screenshot: async () => Buffer.from('photo') },
+    { enqueue: (_parts, label) => labels.push(label) }, { log: (event) => events.push(event) });
+  await monitor.tick(); current = { state: 'results' }; events.length = 0;
+  await monitor.tick(); assert.deepEqual(events, []);
+  current = { state: 'waiting' }; await monitor.tick();
+  current = observe(); await monitor.tick(); await monitor.tick();
+  assert.equal(labels.length, 2); assert.equal(events.some((event) => event.startsWith('monitoring-')), false);
+});
+
+test('dry-run results are silent and defer recovery just like normal results', async () => {
+  let now = 0, state = 'unavailable';
+  const logs = [];
+  const monitor = new Monitor({ read: async () => ({ state }) }, { enqueue: () => assert.fail('dry-run delivery') },
+    { dryRun: true, now: () => now, log: (event) => logs.push(event) });
+  await monitor.tick(); now = 60_000; await monitor.tick();
+  state = 'results'; logs.length = 0; await monitor.tick(); await monitor.tick();
+  assert.deepEqual(logs, []);
+  state = 'waiting'; await monitor.tick();
+  assert.deepEqual(logs, ['check', 'monitoring-recovered']);
+});

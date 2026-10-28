@@ -15,7 +15,9 @@ export function extractDom() {
   const panel = panels[0] || main;
   const questionIdNode = panel.matches('[data-question-id]') ? panel : all(panel, '[data-question-id]')[0];
   const statuses = all(main, '[role="status"], [role="alert"], [data-testid="waiting-screen"], [data-testid="results-screen"]').map(text);
-  const headings = all(panel, 'h1, h2, h3, [role="heading"], [data-testid="question-title"], [data-testid="question-text"], .question-title, .question-text').map(text).filter(Boolean);
+  const headingSelector = 'h1, h2, h3, [role="heading"], [data-testid="question-title"], [data-testid="question-text"], .question-title, .question-text';
+  const headingNodes = all(panel, headingSelector);
+  const headings = headingNodes.map(text).filter(Boolean);
   const controls = all(panel, 'input:not([type="hidden"]):not([type="password"]):not([type="search"]), textarea, select, [role="radio"], [role="checkbox"], [role="textbox"], [role="slider"], [contenteditable="true"]')
     .filter((el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true');
   const buttons = all(panel, 'button, [role="button"]').filter((el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true');
@@ -64,6 +66,14 @@ export function extractDom() {
   }).map((el) => ({ alt: el.getAttribute('alt') || el.getAttribute('aria-label') || '', src: el.getAttribute('src') || '', kind: el.tagName.toLowerCase() }));
   const explicitActive = panel.matches('[data-testid="active-question"], [data-question-state="active"]') ||
     !!all(panel, '[data-testid="active-question"], [data-question-state="active"]')[0];
+  // Feedback is a standalone UI label, not a word occurring inside a prompt or option.
+  const feedbackLabel = /^(?:congratulations|correct(?: answer)?|incorrect(?: answer)?|wrong answer|your answer is (?:correct|incorrect))[.!\u2026]*$/i;
+  const questionHeading = headingNodes.find((node) => text(node) && !/^(wooclap|question|multiple choice|open question)$/i.test(text(node)));
+  const contentNodes = [questionHeading, ...all(panel, '[data-testid="question-title"], [data-testid="question-text"], .question-title, .question-text'),
+    ...choiceNodes, ...all(panel, 'button, [role="button"], fieldset, [role="radiogroup"], textarea, [contenteditable="true"]')].filter(Boolean);
+  const feedback = all(main, 'div, p, span, h1, h2, h3, [role="heading"], [role="status"], [role="alert"]')
+    .some((node) => !contentNodes.some((content) => content.contains(node) || node.contains(content)) &&
+      feedbackLabel.test(text(node).replace(/\s+/g, ' ').trim()));
   // A semantic snapshot is separate from detection/fingerprinting. Keep one
   // MathML representation of KaTeX, never its duplicate visual/TeX layers.
   let unsupported = images.length ? 'Question contains images or graphics that cannot be recreated faithfully.' : '';
@@ -107,7 +117,7 @@ export function extractDom() {
     hasResponseControls: controls.length > 0 || buttons.some((el) => action.test(text(el))) || optionButtons.length >= 2,
     explicitActive,
     loading: !!all(main, '[aria-busy="true"], [role="progressbar"], [data-testid="loading"]')[0],
-    results: !!all(main, '[data-testid="results-screen"], [data-question-state="results"]')[0],
+    results: feedback || !!all(main, '[data-testid="results-screen"], [data-question-state="results"]')[0],
     visualSnapshot, answerState,
   };
 }

@@ -1,7 +1,7 @@
 import { chromium } from 'playwright';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { extractDom, classifyObservation } from './detection.js';
-import { QuestionImageRenderer, validatePhoto, withDeadline } from './question-image.js';
+import { QuestionImageRenderer, validatePhoto, withDeadline, IMAGE_CAPTURE_TIMEOUTS } from './question-image.js';
 
 export const boxInside = (box, outer, tolerance = 1) => box && outer && box.width > 0 && box.height > 0 &&
   box.x >= outer.x - tolerance && box.y >= outer.y - tolerance &&
@@ -247,7 +247,7 @@ export class BrowserSource {
       const nativeAbort = new AbortController();
       try {
         const nativeSignal = AbortSignal.any([signal, nativeAbort.signal]);
-        const photo = await withDeadline(() => this.captureNative(observation, { signal: nativeSignal }), 2000, () => { nativeAbort.abort(); return this.detachNativeSessions(); }, signal);
+        const photo = await withDeadline(() => this.captureNative(observation, { signal: nativeSignal }), IMAGE_CAPTURE_TIMEOUTS.native, () => { nativeAbort.abort(); return this.detachNativeSessions(); }, signal);
         return { photo, imageSource: 'native' };
       } catch (error) { nativeError = error.message; }
       if (this.closed) throw new Error('Question image capture cancelled.');
@@ -255,7 +255,7 @@ export class BrowserSource {
         const photo = await this.renderer.render(observation.visualSnapshot, { signal });
         return { photo, imageSource: 'recreated', nativeError };
       } catch (error) { throw new Error(`Native capture: ${nativeError}\nCard rendering: ${error.message}`); }
-    }, 8000, () => { attemptAbort.abort(); return Promise.allSettled([this.detachNativeSessions(), this.renderer.cancelActive()]); }, this.captureAbort.signal);
+    }, IMAGE_CAPTURE_TIMEOUTS.total, () => { attemptAbort.abort(); return Promise.allSettled([this.detachNativeSessions(), this.renderer.cancelActive()]); }, this.captureAbort.signal);
   }
   // Preserve the existing internal Buffer-returning interface for callers.
   async screenshot(observation) { return (await this.captureImage(observation)).photo; }
